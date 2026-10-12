@@ -21,6 +21,8 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const TIMEOUT_MARKER: &str =
     "[timed out after 2 s: split the work or pass a larger timeout, up to 300]";
 const DISK_MARKER: &str = "[stopped: the run wrote more than 1 GB to the workspace]";
+#[cfg(windows)]
+const VOLUME_MARKER: &str = "[stopped: the run used more than 2 GB of disk space]";
 const GIB: u64 = 1 << 30;
 
 /// The runtime folder, or `None` (test skipped) unless `JAN_TEST_MXC=1`.
@@ -90,8 +92,8 @@ fn py_str(path: &Path) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn computes_exactly() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 30);
     let out = f
         .run("import math, sys\nsys.set_int_max_str_digits(0)\nprint(len(str(math.factorial(10000))))")
@@ -102,8 +104,8 @@ async fn computes_exactly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_to_the_workspace_and_lists_the_files() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 30);
     let out = f
         .run(
@@ -125,8 +127,8 @@ async fn writes_to_the_workspace_and_lists_the_files() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inputs_are_readable_but_not_writable() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 30);
     std::fs::write(f.spec.inputs.join("a.txt"), "hello").unwrap();
     let out = f
@@ -152,8 +154,8 @@ async fn inputs_are_readable_but_not_writable() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_home_folder_cannot_be_read() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 30);
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
@@ -180,8 +182,8 @@ async fn the_home_folder_cannot_be_read() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn there_is_no_network() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 30);
     // A listener on the host's loopback: reaching it would prove the network
     // is open. The second address is TEST-NET-1 (RFC 5737), which is never
@@ -217,8 +219,8 @@ async fn there_is_no_network() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_apps_environment_is_not_passed() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 30);
     // SAFETY: edition 2021, where `set_var` is a safe fn; no test reads it.
     std::env::set_var("JAN_TEST_SECRET", "do-not-pass");
@@ -230,8 +232,8 @@ async fn the_apps_environment_is_not_passed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn text_and_odd_output() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 30);
 
     let out = f.run("print('日本語')").await;
@@ -251,45 +253,44 @@ async fn text_and_odd_output() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn long_output_keeps_the_end() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 30);
 
-    // One line with no newline: only the last 64 KiB is kept. `BashCapture`
-    // adds no truncation note here (it counts lost lines, and none were lost).
+    // One line with no newline: only the last 64 KiB is kept, and the cut is
+    // reported. Nothing is written to a file.
     let out = f
         .run("import sys\nsys.stdout.write('a' * 100000 + 'END')")
         .await;
-    assert_eq!(out.content.len(), 64 * 1024 + "\n[exit 0]".len());
-    assert!(out.content.ends_with("aaaEND\n[exit 0]"));
+    let (body, note) = out.content.rsplit_once('\n').unwrap();
+    assert_eq!(body.len(), 64 * 1024 + "\n[exit 0]".len());
+    assert!(body.ends_with("aaaEND\n[exit 0]"));
+    assert_eq!(
+        note,
+        format!("[output truncated at {} of 100003 bytes]", body.len())
+    );
     assert!(!out.is_error);
 
-    // Too many lines: the last 2000 are kept and a truncation note follows.
+    // Too many lines: the last 2000 are kept and the same plain note follows.
     let out = f.run("for i in range(3000):\n    print('line', i)").await;
-    let truncation = out
-        .content
-        .lines()
-        .find(|l| l.starts_with("[output truncated"))
-        .unwrap_or_else(|| panic!("no truncation line after {:?}", out.content.lines().last()))
-        .to_string();
-    eprintln!("truncation line: {truncation}");
-    assert!(out
-        .content
-        .contains("line 2999\n[exit 0]\n[output truncated at "));
-    assert!(out.content.starts_with("line 1000\n"));
+    let (body, note) = out.content.rsplit_once('\n').unwrap();
+    eprintln!("truncation line: {note}");
+    assert!(body.starts_with("line 1000\n"));
+    assert!(body.ends_with("line 2999\n[exit 0]"));
+    // The total counts raw bytes: Windows text-mode stdout ends lines in CRLF.
+    let eol = if cfg!(windows) { 2 } else { 1 };
+    let total: usize = (0..3000).map(|i| format!("line {i}").len() + eol).sum();
+    assert_eq!(
+        note,
+        format!("[output truncated at {} of {total} bytes]", body.len())
+    );
     assert!(!out.is_error);
-    // Remove the spill file `BashCapture` left for the truncated output.
-    if let Some(rest) = truncation.split("full output written to ").nth(1) {
-        if let Some(path) = rest.split(". Use the read tool").next() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_past_its_time_is_stopped() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 2);
     let started = Instant::now();
     let out = f
@@ -304,8 +305,8 @@ async fn a_run_past_its_time_is_stopped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_writing_too_much_is_stopped() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 120);
     let out = f
         .run(
@@ -327,10 +328,70 @@ async fn a_run_writing_too_much_is_stopped() {
     assert!(size <= GIB + GIB / 2, "went on to {size}");
 }
 
+/// An alternate data stream holds bytes the folder walk does not count (the
+/// file's size is its main stream). The free-space backstop stops it.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_the_walk_cannot_see_hit_the_volume_backstop() {
+    let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
+    let f = Fixture::new(&rt, 120);
+    let out = f
+        .run(
+            "chunk = b'\\1' * (4 << 20)\n\
+             with open('cover.txt:hidden', 'wb') as out:\n\
+             \x20   for _ in range(1536):\n\
+             \x20       out.write(chunk)\n\
+             print('wrote 6 GiB')",
+        )
+        .await;
+    let size = std::fs::metadata(f.spec.workspace.join("cover.txt:hidden"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    eprintln!("hidden stream stopped at {size} bytes");
+    assert!(out.content.contains(VOLUME_MARKER), "{}", out.content);
+    assert!(!out.content.contains(DISK_MARKER), "{}", out.content);
+    assert!(!out.content.contains("wrote 6 GiB"));
+    assert!(out.is_error);
+    assert!(size > 2 * GIB, "stopped early at {size}");
+    assert!(size < 4 * GIB, "went on to {size}");
+}
+
+/// The caller gives up on a run (its future is dropped): the process is
+/// killed with the guard, and the chat can run again at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_run_is_killed_and_frees_the_chat() {
+    let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
+    let f = Fixture::new(&rt, 60);
+    let spec = f.spec.clone();
+    let thread = f.thread.clone();
+    let running = tokio::spawn(async move {
+        let guard = begin_run(&thread).expect("chat is free");
+        run_python(
+            spec,
+            &guard,
+            "import time\nopen('alive', 'w').close()\ntime.sleep(30)",
+            &[],
+        )
+        .await
+    });
+    let alive = f.spec.workspace.join("alive");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !alive.exists() {
+        assert!(Instant::now() < deadline, "the run never started");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    let out = f.run("print('next')").await;
+    assert_eq!(out.content, "next\n[exit 0]");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_stops_the_run_and_the_next_one_works() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 60);
     let spec = f.spec.clone();
     let thread = f.thread.clone();
@@ -345,10 +406,15 @@ async fn cancel_stops_the_run_and_the_next_one_works() {
         .await
         .expect("the cancelled run returns promptly")
         .unwrap();
-    match result {
-        Ok(out) => assert!(out.is_error, "{}", out.content),
-        Err(e) => assert_eq!(e, "the python run was cancelled"),
-    }
+    // Started for 1.5 s, so the process exists and is killed.
+    let out = result.expect("a started run returns its output");
+    assert!(
+        out.content
+            .ends_with("[exit -1]\n[stopped: cancelled by the user]"),
+        "{}",
+        out.content
+    );
+    assert!(out.is_error);
     assert!(started.elapsed() < Duration::from_secs(12));
 
     let out = f.run("print('again')").await;
@@ -357,8 +423,8 @@ async fn cancel_stops_the_run_and_the_next_one_works() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_run_in_the_same_chat_is_refused() {
-    let Some(rt) = runtime() else { return };
     let _serial = SERIAL.lock().await;
+    let Some(rt) = runtime() else { return };
     let f = Fixture::new(&rt, 30);
     let spec = f.spec.clone();
     let thread = f.thread.clone();

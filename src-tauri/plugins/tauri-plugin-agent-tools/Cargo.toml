@@ -50,6 +50,9 @@ base64 = "0.22"
 # the CLI graph.
 png = "0.17"
 glob = "0.3"
+# Python runs are recorded in the app's log (`tauri-plugin-log` collects it).
+# Already in every lockfile that includes this crate.
+log = "0.4"
 percent-encoding = "2"
 ignore = "0.4"
 regex = "1"

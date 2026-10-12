@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
@@ -12,22 +11,16 @@ use std::time::{Duration, Instant};
 use mxc_sdk::v1::{self, MxcProcess, SpawnOptions, StreamCloser, TelemetryConfig, WaitResult};
 
 use super::availability::{self, PythonStatus};
+use super::disk::{disk_stop, free_space, DiskStop, FolderWatch};
+pub use super::disk::{DISK_LIMIT_BYTES, POLL_MS};
 use super::request::{build_request, RunSpec, MAX_TIMEOUT_S};
 use super::snapshot::{changed, snapshot, total_size, ChangedFile, MAX_LISTED_FILES};
 use crate::tools::handlers::BashCapture;
 
-/// A run is stopped once the workspace has grown by more than this since it started.
-pub const DISK_LIMIT_BYTES: u64 = 1 << 30;
-/// The longest gap between two measurements of the workspace size while a run
-/// is going. Small workspaces are measured more often (see `measure_gap`).
-pub const POLL_MS: u64 = 500;
-
-/// How often the process is checked for exit, and the shortest gap between two
-/// workspace measurements. Shorter than `POLL_MS` so a quick script does not
-/// wait out a whole disk-check interval before returning.
+/// How often the process is checked for exit, the deadline and the stops. The
+/// disk is measured elsewhere (`FolderWatch`, and the free space every
+/// `POLL_MS`), so this poll never waits on a walk.
 const EXIT_POLL: Duration = Duration::from_millis(20);
-/// Measuring the workspace may take up to 1/`MEASURE_SHARE` of the run's time.
-const MEASURE_SHARE: u32 = 10;
 /// How long a killed process may take to be seen as gone before giving up on it.
 const KILL_GRACE: Duration = Duration::from_secs(10);
 /// How long the output readers get to reach the end of the pipes once the
@@ -43,9 +36,185 @@ pub struct RunOutcome {
     /// Output, `[exit N]`, then the markers (`[file: ...]` lines list the files
     /// the run created or changed).
     pub content: String,
-    /// True when the exit code was not 0, the run timed out, it was stopped by
-    /// the disk limit, or it was cancelled.
+    /// True when the exit code was not 0, the run timed out, or it was stopped
+    /// (a disk limit, or cancelled).
     pub is_error: bool,
+}
+
+/// Why a run was stopped before it ended on its own (the timeout aside).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The workspace grew by more than `DISK_LIMIT_BYTES`.
+    WorkspaceLimit,
+    /// The volume's free space dropped by more than twice that.
+    VolumeLimit,
+    /// `cancel`, or the run's guard was dropped.
+    Cancelled,
+}
+
+impl StopReason {
+    /// The result line for this stop.
+    pub fn marker(self) -> &'static str {
+        match self {
+            StopReason::WorkspaceLimit => {
+                "[stopped: the run wrote more than 1 GB to the workspace]"
+            }
+            StopReason::VolumeLimit => "[stopped: the run used more than 2 GB of disk space]",
+            StopReason::Cancelled => "[stopped: cancelled by the user]",
+        }
+    }
+}
+
+impl From<DiskStop> for StopReason {
+    fn from(stop: DiskStop) -> Self {
+        match stop {
+            DiskStop::Folder => StopReason::WorkspaceLimit,
+            DiskStop::Volume => StopReason::VolumeLimit,
+        }
+    }
+}
+
+/// Something a run can be stopped through (the sandboxed process; a fake in
+/// tests).
+trait Kill {
+    fn kill_now(&self) -> std::io::Result<()>;
+}
+
+impl Kill for Mutex<MxcProcess> {
+    fn kill_now(&self) -> std::io::Result<()> {
+        lock(self).kill()
+    }
+}
+
+/// Kill `process`, logging (not returning) a failure: the callers are a cancel
+/// and a drop, which have no one to hand it to.
+fn kill_logged<P: Kill>(process: &P, why: &str) {
+    if let Err(e) = process.kill_now() {
+        log::warn!("python run: could not kill the process ({why}): {e}");
+    }
+}
+
+/// The run registered for one chat.
+struct Slot<P> {
+    /// Which claim (`begin`) this slot belongs to. A run whose token no longer
+    /// matches was abandoned and must not touch a later run's slot.
+    token: u64,
+    /// Set while the sandboxed process exists, so `cancel` can kill it.
+    process: Option<Arc<P>>,
+    /// `cancel` was called for this run.
+    cancelled: bool,
+}
+
+/// Which chats have a run, and how to stop each. One process-wide instance
+/// (`registry()`); tests make their own with a fake process.
+struct Registry<P> {
+    runs: Mutex<HashMap<String, Slot<P>>>,
+    next_token: AtomicU64,
+}
+
+impl<P: Kill> Registry<P> {
+    fn new() -> Self {
+        Registry {
+            runs: Mutex::new(HashMap::new()),
+            next_token: AtomicU64::new(1),
+        }
+    }
+
+    /// Claim the chat; the token identifies this claim from now on.
+    fn begin(&self, thread_id: &str) -> Result<u64, String> {
+        let mut runs = lock(&self.runs);
+        if runs.contains_key(thread_id) {
+            return Err(ALREADY_RUNNING.to_string());
+        }
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
+        runs.insert(
+            thread_id.to_string(),
+            Slot {
+                token,
+                process: None,
+                cancelled: false,
+            },
+        );
+        Ok(token)
+    }
+
+    /// Release the claim, killing its process if one is still attached (the
+    /// caller gave up on the run).
+    fn end(&self, thread_id: &str, token: u64) {
+        let process = {
+            let mut runs = lock(&self.runs);
+            match runs.get(thread_id) {
+                Some(slot) if slot.token == token => {
+                    runs.remove(thread_id).and_then(|slot| slot.process)
+                }
+                _ => None,
+            }
+        };
+        if let Some(process) = process {
+            kill_logged(&*process, "the run was abandoned");
+        }
+    }
+
+    /// Mark the chat's run cancelled and kill its process if it has one. True
+    /// when the chat had a run.
+    fn cancel(&self, thread_id: &str) -> bool {
+        let process = {
+            let mut runs = lock(&self.runs);
+            let Some(slot) = runs.get_mut(thread_id) else {
+                return false;
+            };
+            slot.cancelled = true;
+            slot.process.clone()
+        };
+        if let Some(process) = process {
+            kill_logged(&*process, "cancel");
+        }
+        true
+    }
+
+    /// Whether the claim `token` may no longer run: cancelled, or no longer the
+    /// chat's current claim (released or replaced).
+    fn is_cancelled(&self, thread_id: &str, token: u64) -> bool {
+        lock(&self.runs)
+            .get(thread_id)
+            .map_or(true, |slot| slot.token != token || slot.cancelled)
+    }
+
+    /// Make the process reachable by `cancel`. True when the claim may no
+    /// longer run; then nothing is recorded and the caller kills the process.
+    fn attach(&self, thread_id: &str, token: u64, process: &Arc<P>) -> bool {
+        let mut runs = lock(&self.runs);
+        match runs.get_mut(thread_id) {
+            Some(slot) if slot.token == token => {
+                slot.process = Some(Arc::clone(process));
+                slot.cancelled
+            }
+            _ => true,
+        }
+    }
+
+    /// Forget the (finished) process. True when the run was cancelled or its
+    /// claim was released meanwhile.
+    fn detach(&self, thread_id: &str, token: u64) -> bool {
+        let mut runs = lock(&self.runs);
+        match runs.get_mut(thread_id) {
+            Some(slot) if slot.token == token => {
+                slot.process = None;
+                slot.cancelled
+            }
+            _ => true,
+        }
+    }
+}
+
+fn registry() -> &'static Registry<Mutex<MxcProcess>> {
+    static REGISTRY: OnceLock<Registry<Mutex<MxcProcess>>> = OnceLock::new();
+    REGISTRY.get_or_init(Registry::new)
+}
+
+/// A poisoned lock only means another run panicked; the data is still usable.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// One chat's claim on running python. Held from before the inputs are staged
@@ -54,88 +223,29 @@ pub struct RunOutcome {
 #[must_use = "the chat is free to run again as soon as the guard is dropped"]
 pub struct RunGuard {
     thread_id: String,
+    token: u64,
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
-        let slot = registry().remove(&self.thread_id);
-        if let Some(process) = slot.and_then(|s| s.process) {
-            let _ = lock(&process).kill();
-        }
+        registry().end(&self.thread_id, self.token);
     }
-}
-
-/// The run registered for one chat.
-#[derive(Default)]
-struct Slot {
-    /// Set while the sandboxed process exists, so `cancel` can kill it.
-    process: Option<Arc<Mutex<MxcProcess>>>,
-    /// `cancel` was called for this run.
-    cancelled: bool,
-}
-
-fn registry() -> MutexGuard<'static, HashMap<String, Slot>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Slot>>> = OnceLock::new();
-    lock(REGISTRY.get_or_init(Default::default))
-}
-
-/// A poisoned lock only means another run panicked; the data is still usable.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Claim the chat for one run. A second claim while one is held is refused at
 /// once rather than queued.
 pub fn begin_run(thread_id: &str) -> Result<RunGuard, String> {
-    let mut runs = registry();
-    if runs.contains_key(thread_id) {
-        return Err(ALREADY_RUNNING.to_string());
-    }
-    runs.insert(thread_id.to_string(), Slot::default());
+    let token = registry().begin(thread_id)?;
     Ok(RunGuard {
         thread_id: thread_id.to_string(),
+        token,
     })
 }
 
 /// Stop the chat's run: kill its process if it has started, or keep it from
 /// starting. True when the chat had a run to stop.
 pub fn cancel(thread_id: &str) -> bool {
-    let process = {
-        let mut runs = registry();
-        let Some(slot) = runs.get_mut(thread_id) else {
-            return false;
-        };
-        slot.cancelled = true;
-        slot.process.clone()
-    };
-    if let Some(process) = process {
-        let _ = lock(&process).kill();
-    }
-    true
-}
-
-fn is_cancelled(thread_id: &str) -> bool {
-    registry().get(thread_id).is_some_and(|s| s.cancelled)
-}
-
-/// Make the process reachable by `cancel`. True when a cancel already came in.
-fn attach(thread_id: &str, process: &Arc<Mutex<MxcProcess>>) -> bool {
-    let mut runs = registry();
-    let slot = runs.entry(thread_id.to_string()).or_default();
-    slot.process = Some(Arc::clone(process));
-    slot.cancelled
-}
-
-/// Forget the (finished) process. Returns whether the run was cancelled.
-fn detach(thread_id: &str) -> bool {
-    let mut runs = registry();
-    match runs.get_mut(thread_id) {
-        Some(slot) => {
-            slot.process = None;
-            slot.cancelled
-        }
-        None => false,
-    }
+    registry().cancel(thread_id)
 }
 
 /// Run `code` in the sandbox described by `spec`, for the chat `guard` holds.
@@ -162,11 +272,15 @@ async fn run_python_checked(
     skipped: &[(String, String)],
     status: fn() -> PythonStatus,
 ) -> Result<RunOutcome, String> {
-    let thread_id = guard.thread_id.clone();
+    let claim = Claim {
+        thread_id: guard.thread_id.clone(),
+        token: guard.token,
+    };
     let code = code.to_string();
     let skipped = skipped.to_vec();
     // Everything below blocks: the first availability check probes MXC, and the
-    // snapshots, the spawn, the pipes and the waits are all synchronous.
+    // snapshots, the spawn, the pipes and the waits are all synchronous. It may
+    // outlive this future (and the guard): the token makes it stop then.
     tokio::task::spawn_blocking(move || {
         let status = status();
         if !status.available {
@@ -175,33 +289,42 @@ async fn run_python_checked(
                 status.reason.as_deref().unwrap_or("unknown reason")
             ));
         }
-        run_blocking(&spec, &thread_id, &code, &skipped)
+        run_blocking(&spec, &claim, &code, &skipped)
     })
     .await
     .map_err(|e| format!("the python run failed: {e}"))?
+}
+
+/// The run's chat and claim, as the blocking part sees them.
+struct Claim {
+    thread_id: String,
+    token: u64,
 }
 
 /// How the watch over a running process ended.
 #[derive(Default)]
 struct Watch {
     timed_out: bool,
-    disk_stopped: bool,
+    stopped: Option<StopReason>,
     /// The process could not be checked or stopped.
     error: Option<String>,
 }
 
 fn run_blocking(
     spec: &RunSpec,
-    thread_id: &str,
+    claim: &Claim,
     code: &str,
     skipped: &[(String, String)],
 ) -> Result<RunOutcome, String> {
-    if is_cancelled(thread_id) {
+    let runs = registry();
+    let thread_id = claim.thread_id.as_str();
+    if runs.is_cancelled(thread_id, claim.token) {
         return Err(CANCELLED.to_string());
     }
     let before =
         snapshot(&spec.workspace).map_err(|e| format!("cannot read the python workspace: {e}"))?;
     let before_size = total_size(&before);
+    let start_free = free_space(&spec.workspace);
     let started = Instant::now();
 
     let options = SpawnOptions {
@@ -216,9 +339,7 @@ fn run_blocking(
             format!("cannot start python in the sandbox: {e}"),
         )
     })?;
-    if let Err(e) = lower_priority(process.id()) {
-        eprintln!("python run: could not lower the priority ({e}); continuing");
-    }
+    lower_priority(process.id());
     // The timeout is the script's own time, so it counts from the spawn.
     let deadline = Instant::now() + Duration::from_secs(u64::from(spec.timeout_s));
 
@@ -229,12 +350,13 @@ fn run_blocking(
         .collect();
     let streams = [process.take_stdout(), process.take_stderr()];
     let process = Arc::new(Mutex::new(process));
-    if attach(thread_id, &process) {
-        // Cancelled between the check above and the spawn.
-        let _ = lock(&process).kill();
+    if runs.attach(thread_id, claim.token, &process) {
+        // Cancelled, or abandoned by its caller, before the spawn finished.
+        kill_logged(&*process, "the run was cancelled while starting");
     }
 
-    let capture = Arc::new(Mutex::new(BashCapture::new(None)));
+    // Never spills to a file: the overflow is cut, and the cut is reported.
+    let capture = Arc::new(Mutex::new(BashCapture::without_spill()));
     let output_bytes = Arc::new(AtomicU64::new(0));
     let (done_tx, done_rx) = mpsc::channel();
     let readers: Vec<JoinHandle<()>> = streams
@@ -260,7 +382,11 @@ fn run_blocking(
         })
     });
 
-    let watch = watch(&process, &spec.workspace, before_size, deadline);
+    let folder = FolderWatch::start(spec.workspace.clone(), before_size);
+    let watch = watch(&process, deadline, &|| {
+        disk_stop(start_free, free_space(&spec.workspace), folder.growth())
+    });
+    drop(folder);
     let waited = if watch.error.is_some() {
         // Not known to be gone: `wait` could block for the whole timeout, and
         // dropping the handle kills the tree anyway.
@@ -268,7 +394,7 @@ fn run_blocking(
     } else {
         Some(lock(&process).wait())
     };
-    let cancelled = detach(thread_id);
+    let cancelled = runs.detach(thread_id, claim.token);
     drop(process);
 
     // The tree is dead, so the pipes are closed and the readers reach their
@@ -304,6 +430,9 @@ fn run_blocking(
         }
         None => None,
     };
+    let stopped = watch
+        .stopped
+        .or_else(|| cancelled.then_some(StopReason::Cancelled));
 
     let capture = Arc::try_unwrap(capture)
         .map_err(|_| "the python output is still being read".to_string())?
@@ -316,24 +445,21 @@ fn run_blocking(
     let content = format_result(
         captured,
         timed_out.then_some(spec.timeout_s),
-        watch.disk_stopped,
+        stopped,
         skipped,
         &files,
     );
-    let outcome = RunOutcome {
+    log::info!(
+        "python run: thread {thread_id}, {:.2} s, exit {}, timed out {timed_out}, \
+         stopped {stopped:?}, {} output bytes",
+        started.elapsed().as_secs_f64(),
+        code.map_or_else(|| "none".to_string(), |c| c.to_string()),
+        output_bytes.load(Ordering::Relaxed),
+    );
+    Ok(RunOutcome {
         content,
-        is_error: code != Some(0) || timed_out || watch.disk_stopped || cancelled,
-    };
-    log_run(&RunLog {
-        thread_id,
-        took: started.elapsed(),
-        code,
-        timed_out,
-        disk_stopped: watch.disk_stopped,
-        cancelled,
-        output_bytes: output_bytes.load(Ordering::Relaxed),
-    });
-    Ok(outcome)
+        is_error: code != Some(0) || timed_out || stopped.is_some(),
+    })
 }
 
 /// Read one of the process's pipes into the shared capture until it ends.
@@ -360,43 +486,9 @@ fn spawn_reader(
     })
 }
 
-/// How many bytes the workspace has grown by since it held `before_size`.
-///
-/// Unreadable parts of the folder are skipped, and an unreadable root counts as
-/// no growth: the check must not stop a run by mistake.
-///
-/// On Windows a folder listing gives each file's size as its directory entry
-/// last recorded it, and NTFS updates that for a file open for writing only
-/// when it is closed: a script writing 2 GiB through one handle was listed at
-/// 0 bytes throughout. So there each file's size is read from the file itself
-/// (`symlink_metadata` opens it without following links). Unix listings are
-/// already exact.
-fn grown_since(workspace: &Path, before_size: u64) -> u64 {
-    let Ok(listed) = snapshot(workspace) else {
-        return 0;
-    };
-    let now = if cfg!(windows) {
-        listed
-            .iter()
-            .map(|(rel, (size, _))| {
-                std::fs::symlink_metadata(workspace.join(rel)).map_or(*size, |m| m.len())
-            })
-            .sum()
-    } else {
-        total_size(&listed)
-    };
-    now.saturating_sub(before_size)
-}
-
-/// The pause before the next workspace measurement, given how long the last one
-/// took: walking gets about a tenth of the time, never more than `POLL_MS`
-/// apart. A fixed 0.5 s is too coarse: a script can put 2 GB into the page cache
-/// in well under a second, before a fixed check would first look.
-fn measure_gap(walk: Duration) -> Duration {
-    (walk * MEASURE_SHARE).clamp(EXIT_POLL, Duration::from_millis(POLL_MS))
-}
-
-/// Wait for the process to end, enforcing the deadline and the disk limit.
+/// Wait for the process to end, enforcing the deadline and stopping it when
+/// `disk` says so. `disk` is asked every `POLL_MS` and must be cheap (it reads
+/// the free space and the latest walk's result, never walks itself).
 ///
 /// MXC enforces `timeout_ms` only inside `wait` on Windows (its `try_wait`
 /// reports a timeout only after `kill_for_timeout`), while Bubblewrap's
@@ -404,12 +496,11 @@ fn measure_gap(walk: Duration) -> Duration {
 /// `TimedOut` from `try_wait` is taken as the timeout either way.
 fn watch(
     process: &Mutex<MxcProcess>,
-    workspace: &Path,
-    before_size: u64,
     deadline: Instant,
+    disk: &dyn Fn() -> Option<DiskStop>,
 ) -> Watch {
     let mut watch = Watch::default();
-    let mut next_measure = Instant::now() + EXIT_POLL;
+    let mut next_disk_check = Instant::now() + Duration::from_millis(POLL_MS);
     let mut killed_at: Option<Instant> = None;
     loop {
         let state = lock(process).try_wait();
@@ -440,17 +531,15 @@ fn watch(
             watch.timed_out = true;
             killed_at = Some(now);
             continue;
-        } else if now >= next_measure {
-            let grown = grown_since(workspace, before_size);
-            let measured = Instant::now();
-            next_measure = measured + measure_gap(measured.duration_since(now));
-            if grown > DISK_LIMIT_BYTES {
+        } else if now >= next_disk_check {
+            next_disk_check = now + Duration::from_millis(POLL_MS);
+            if let Some(stop) = disk() {
                 if let Err(e) = lock(process).kill() {
                     watch.error = Some(format!("cannot stop the python process: {e}"));
                     return watch;
                 }
-                watch.disk_stopped = true;
-                killed_at = Some(measured);
+                watch.stopped = Some(stop.into());
+                killed_at = Some(now);
                 continue;
             }
         }
@@ -459,9 +548,10 @@ fn watch(
 }
 
 /// Give the sandboxed process below-normal CPU priority, so a busy script does
-/// not slow the app down. Processes it starts inherit the class.
+/// not slow the app down. Processes it starts inherit the class. A failure is
+/// logged and the run goes on.
 #[cfg(windows)]
-fn lower_priority(pid: u32) -> Result<(), String> {
+fn lower_priority(pid: u32) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS, PROCESS_SET_INFORMATION,
@@ -469,66 +559,36 @@ fn lower_priority(pid: u32) -> Result<(), String> {
     // SAFETY: plain Win32 calls on a handle opened and closed here. The pid
     // cannot be reused meanwhile: MXC holds a handle to the process until it is
     // reaped.
-    unsafe {
+    let result = unsafe {
         let handle = OpenProcess(PROCESS_SET_INFORMATION, 0, pid);
         if handle.is_null() {
-            return Err(std::io::Error::last_os_error().to_string());
+            Err(std::io::Error::last_os_error())
+        } else {
+            let ok = SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS);
+            let error = std::io::Error::last_os_error();
+            CloseHandle(handle);
+            if ok == 0 {
+                Err(error)
+            } else {
+                Ok(())
+            }
         }
-        let ok = SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS);
-        let error = std::io::Error::last_os_error();
-        CloseHandle(handle);
-        if ok == 0 {
-            return Err(error.to_string());
-        }
+    };
+    if let Err(e) = result {
+        log::warn!("python run: could not lower the priority ({e}); continuing");
     }
-    Ok(())
 }
 
-/// Nice the sandboxed process to 10, so a busy script does not slow the app
-/// down. Processes it starts afterwards inherit the value.
-#[cfg(unix)]
-fn lower_priority(pid: u32) -> Result<(), String> {
-    use nix::libc;
-    // SAFETY: `setpriority` takes plain integers. The pid cannot be reused
-    // meanwhile: the process is not reaped until MXC waits on it.
-    let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, 10) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    Ok(())
-}
-
-/// What is recorded about a run. Never the code or the output.
-struct RunLog<'a> {
-    thread_id: &'a str,
-    took: Duration,
-    code: Option<i32>,
-    timed_out: bool,
-    disk_stopped: bool,
-    cancelled: bool,
-    output_bytes: u64,
-}
-
-/// The plugin has no logging crate; its diagnostics go to stderr.
-fn log_run(log: &RunLog<'_>) {
-    eprintln!(
-        "python run: thread {}, {:.2} s, exit {}, timed out {}, disk stopped {}, \
-         cancelled {}, {} output bytes",
-        log.thread_id,
-        log.took.as_secs_f64(),
-        log.code
-            .map_or_else(|| "none".to_string(), |c| c.to_string()),
-        log.timed_out,
-        log.disk_stopped,
-        log.cancelled,
-        log.output_bytes,
-    );
-}
+/// Unix lowers the priority in the command itself (`nice -n 10`, see
+/// `request::build_request`): the pid MXC returns there is Bubblewrap's
+/// wrapper, which has already started python.
+#[cfg(not(windows))]
+fn lower_priority(_pid: u32) {}
 
 /// A run that ended in a tool error. `error` is our own message, never the
 /// script's output.
 fn log_failure(thread_id: &str, started: Instant, error: String) -> String {
-    eprintln!(
+    log::warn!(
         "python run: thread {thread_id}, {:.2} s, failed: {error}",
         started.elapsed().as_secs_f64()
     );
@@ -536,38 +596,38 @@ fn log_failure(thread_id: &str, started: Instant, error: String) -> String {
 }
 
 /// The text the model reads: the captured output (ending in `[exit N]`), then
-/// one line per skipped input, the timeout, the disk stop, and each changed file
+/// one line per skipped input, the timeout, the stop, and each changed file
 /// (at most `MAX_LISTED_FILES`, the rest counted).
 pub fn format_result(
     captured: String,
     timed_out: Option<u32>,
-    disk_stopped: bool,
+    stopped: Option<StopReason>,
     skipped: &[(String, String)],
     files: &[ChangedFile],
 ) -> String {
     let mut out = captured;
-    let mut line = |text: String| {
+    let mut line = |text: &str| {
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str(&text);
+        out.push_str(text);
     };
     for (name, reason) in skipped {
-        line(format!("[input skipped: {name} ({reason})]"));
+        line(&format!("[input skipped: {name} ({reason})]"));
     }
     if let Some(seconds) = timed_out {
-        line(format!(
+        line(&format!(
             "[timed out after {seconds} s: split the work or pass a larger timeout, up to {MAX_TIMEOUT_S}]"
         ));
     }
-    if disk_stopped {
-        line("[stopped: the run wrote more than 1 GB to the workspace]".to_string());
+    if let Some(stop) = stopped {
+        line(stop.marker());
     }
     for file in files.iter().take(MAX_LISTED_FILES) {
-        line(format!("[file: {} ({} bytes)]", file.path, file.size));
+        line(&format!("[file: {} ({} bytes)]", file.path, file.size));
     }
     if files.len() > MAX_LISTED_FILES {
-        line(format!(
+        line(&format!(
             "[files: {} more not listed]",
             files.len() - MAX_LISTED_FILES
         ));
@@ -606,7 +666,7 @@ mod tests {
         let out = format_result(
             "hello\n[exit 1]".to_string(),
             Some(30),
-            true,
+            Some(StopReason::WorkspaceLimit),
             &[skipped("big.bin", "larger than 256 MB")],
             &[file("out.csv", 12)],
         );
@@ -623,7 +683,7 @@ mod tests {
     #[test]
     fn nothing_to_add_leaves_the_output_alone() {
         assert_eq!(
-            format_result("[exit 0]".to_string(), None, false, &[], &[]),
+            format_result("[exit 0]".to_string(), None, None, &[], &[]),
             "[exit 0]"
         );
     }
@@ -633,7 +693,7 @@ mod tests {
         let out = format_result(
             "[exit 0]".to_string(),
             None,
-            false,
+            None,
             &[
                 skipped("a.txt", "not found"),
                 skipped("b", "invalid file name"),
@@ -649,7 +709,7 @@ mod tests {
     #[test]
     fn files_are_listed_up_to_fifty_and_the_rest_counted() {
         let files: Vec<ChangedFile> = (0..53).map(|i| file(&format!("f{i:02}.txt"), i)).collect();
-        let out = format_result("[exit 0]".to_string(), None, false, &[], &files);
+        let out = format_result("[exit 0]".to_string(), None, None, &[], &files);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 1 + 50 + 1);
         assert_eq!(lines[1], "[file: f00.txt (0 bytes)]");
@@ -661,7 +721,7 @@ mod tests {
     #[test]
     fn exactly_fifty_files_need_no_count() {
         let files: Vec<ChangedFile> = (0..50).map(|i| file(&format!("f{i}"), 1)).collect();
-        let out = format_result("[exit 0]".to_string(), None, false, &[], &files);
+        let out = format_result("[exit 0]".to_string(), None, None, &[], &files);
         assert_eq!(out.lines().count(), 51);
         assert!(!out.contains("more not listed"));
     }
@@ -671,7 +731,7 @@ mod tests {
         let out = format_result(
             "[exit 0]".to_string(),
             None,
-            false,
+            None,
             &[],
             &[file("結果/表.csv", 2048)],
         );
@@ -683,7 +743,7 @@ mod tests {
         let out = format_result(
             "x\n[exit 0]\n[output truncated at 10 of 99 bytes]".to_string(),
             None,
-            true,
+            Some(StopReason::WorkspaceLimit),
             &[],
             &[],
         );
@@ -795,82 +855,252 @@ mod tests {
         assert_eq!(err, "the python run was cancelled");
     }
 
-    /// A scratch folder under the host temp dir, removed on drop.
-    struct Scratch(std::path::PathBuf);
-
-    impl Scratch {
-        fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("jan_run_scratch_{}", unique_thread()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Scratch(dir)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// Windows lists a file still open for writing at the size its directory
-    /// entry last had (0 for a new file) until it is closed. The disk check must
-    /// see the bytes anyway, or one long write would get past the limit.
     #[test]
-    fn growth_counts_a_file_that_is_still_being_written() {
-        use std::io::Write;
-        let dir = Scratch::new();
-        std::fs::write(dir.0.join("old.txt"), b"12345").unwrap();
-        let before = total_size(&snapshot(&dir.0).unwrap());
-        assert_eq!(before, 5);
-
-        let mut open = std::fs::File::create(dir.0.join("big.bin")).unwrap();
-        let chunk = vec![0u8; 1 << 20];
-        for _ in 0..8 {
-            open.write_all(&chunk).unwrap();
-        }
-        assert_eq!(grown_since(&dir.0, before), 8 << 20);
-        drop(open);
-        assert_eq!(grown_since(&dir.0, before), 8 << 20);
+    fn every_stop_has_its_exact_marker() {
+        assert_eq!(
+            StopReason::WorkspaceLimit.marker(),
+            "[stopped: the run wrote more than 1 GB to the workspace]"
+        );
+        assert_eq!(
+            StopReason::VolumeLimit.marker(),
+            "[stopped: the run used more than 2 GB of disk space]"
+        );
+        assert_eq!(
+            StopReason::Cancelled.marker(),
+            "[stopped: cancelled by the user]"
+        );
+        assert_eq!(
+            StopReason::from(DiskStop::Folder),
+            StopReason::WorkspaceLimit
+        );
+        assert_eq!(StopReason::from(DiskStop::Volume), StopReason::VolumeLimit);
     }
 
-    /// Reading every file's size costs more than the listing on Windows;
-    /// `measure_gap` spaces the checks out by it. Printed for the record.
     #[test]
-    fn growth_of_ten_thousand_files_is_measured() {
-        let dir = Scratch::new();
-        for i in 0..100 {
-            let sub = dir.0.join(format!("d{i}"));
-            std::fs::create_dir(&sub).unwrap();
-            for j in 0..100 {
-                std::fs::write(sub.join(format!("f{j}")), b"x").unwrap();
+    fn a_cancelled_run_says_so_after_the_exit_and_before_the_files() {
+        let out = format_result(
+            "partial\n[exit -1]".to_string(),
+            None,
+            Some(StopReason::Cancelled),
+            &[skipped("a.bin", "larger than 256 MB")],
+            &[file("half.csv", 3)],
+        );
+        assert_eq!(
+            out,
+            "partial\n[exit -1]\n\
+             [input skipped: a.bin (larger than 256 MB)]\n\
+             [stopped: cancelled by the user]\n\
+             [file: half.csv (3 bytes)]"
+        );
+    }
+
+    #[test]
+    fn the_volume_stop_follows_a_timeout() {
+        let out = format_result(
+            "[terminated by signal]".to_string(),
+            Some(2),
+            Some(StopReason::VolumeLimit),
+            &[],
+            &[],
+        );
+        assert_eq!(
+            out,
+            "[terminated by signal]\n\
+             [timed out after 2 s: split the work or pass a larger timeout, up to 300]\n\
+             [stopped: the run used more than 2 GB of disk space]"
+        );
+    }
+
+    /// A stand-in for the sandboxed process that counts kills.
+    #[derive(Default)]
+    struct Fake {
+        kills: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+
+    impl Kill for Fake {
+        fn kill_now(&self) -> std::io::Result<()> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(std::io::Error::other("cannot kill"))
+            } else {
+                Ok(())
             }
         }
-        let started = std::time::Instant::now();
-        assert_eq!(grown_since(&dir.0, 0), 10_000);
-        let took = started.elapsed();
-        println!("growth of 10000 files measured in {took:?}");
-        assert!(took < Duration::from_secs(30));
+    }
+
+    fn kills(fake: &Arc<Fake>) -> usize {
+        fake.kills.load(Ordering::SeqCst)
     }
 
     #[test]
-    fn growth_is_zero_for_a_missing_folder_or_a_shrunk_one() {
-        let dir = Scratch::new();
-        assert_eq!(grown_since(&dir.0.join("gone"), 0), 0);
-        std::fs::write(dir.0.join("a"), b"12").unwrap();
-        assert_eq!(grown_since(&dir.0, 100), 0);
+    fn a_claim_released_before_its_spawn_leaves_no_slot_behind() {
+        let runs = Registry::<Fake>::new();
+        let token = runs.begin("t").unwrap();
+        // The caller gave up while the blocking part was still starting.
+        runs.end("t", token);
+        assert!(runs.is_cancelled("t", token));
+        let late = Arc::new(Fake::default());
+        assert!(
+            runs.attach("t", token, &late),
+            "the late process is refused"
+        );
+        assert!(
+            lock(&runs.runs).is_empty(),
+            "attach must not re-create the slot"
+        );
+        assert!(runs.detach("t", token));
+        assert!(lock(&runs.runs).is_empty());
+        let next = runs.begin("t").expect("the chat is free again");
+        runs.end("t", next);
     }
 
     #[test]
-    fn measuring_gets_a_tenth_of_the_time_within_bounds() {
-        assert_eq!(measure_gap(Duration::ZERO), Duration::from_millis(20));
-        assert_eq!(
-            measure_gap(Duration::from_millis(15)),
-            Duration::from_millis(150)
+    fn a_stale_run_cannot_touch_the_next_runs_slot() {
+        let runs = Registry::<Fake>::new();
+        let old = runs.begin("t").unwrap();
+        runs.end("t", old);
+        let new = runs.begin("t").unwrap();
+        assert_ne!(old, new);
+
+        let current = Arc::new(Fake::default());
+        assert!(!runs.attach("t", new, &current));
+        let stale = Arc::new(Fake::default());
+        assert!(runs.attach("t", old, &stale));
+        assert!(runs.detach("t", old), "a stale run counts as cancelled");
+        assert!(!runs.is_cancelled("t", new));
+        runs.end("t", old);
+        assert!(runs.begin("t").is_err(), "a stale end leaves the new claim");
+
+        // The new run's process is still the one `cancel` reaches.
+        assert!(runs.cancel("t"));
+        assert_eq!(kills(&current), 1);
+        assert_eq!(kills(&stale), 0);
+        assert!(runs.detach("t", new));
+        runs.end("t", new);
+        assert!(lock(&runs.runs).is_empty());
+    }
+
+    #[test]
+    fn ending_a_claim_kills_its_running_process() {
+        let runs = Registry::<Fake>::new();
+        let token = runs.begin("t").unwrap();
+        let process = Arc::new(Fake::default());
+        assert!(!runs.attach("t", token, &process));
+        runs.end("t", token);
+        assert_eq!(kills(&process), 1);
+        assert!(lock(&runs.runs).is_empty());
+    }
+
+    #[test]
+    fn a_finished_process_is_not_killed_when_the_claim_ends() {
+        let runs = Registry::<Fake>::new();
+        let token = runs.begin("t").unwrap();
+        let process = Arc::new(Fake::default());
+        assert!(!runs.attach("t", token, &process));
+        assert!(!runs.detach("t", token), "not cancelled");
+        runs.end("t", token);
+        assert_eq!(kills(&process), 0);
+    }
+
+    #[test]
+    fn cancel_before_the_spawn_makes_the_attach_refuse() {
+        let runs = Registry::<Fake>::new();
+        let token = runs.begin("t").unwrap();
+        assert!(runs.cancel("t"));
+        assert!(runs.is_cancelled("t", token));
+        let process = Arc::new(Fake::default());
+        assert!(runs.attach("t", token, &process));
+        assert!(runs.detach("t", token));
+        runs.end("t", token);
+    }
+
+    #[test]
+    fn cancel_kills_a_running_process_and_the_detach_reports_it() {
+        let runs = Registry::<Fake>::new();
+        let token = runs.begin("t").unwrap();
+        let process = Arc::new(Fake::default());
+        assert!(!runs.attach("t", token, &process));
+        assert!(runs.cancel("t"));
+        assert_eq!(kills(&process), 1);
+        assert!(runs.detach("t", token));
+        runs.end("t", token);
+        assert_eq!(kills(&process), 1, "detached, so not killed again");
+    }
+
+    #[test]
+    fn a_failed_kill_on_cancel_is_logged_not_fatal() {
+        let runs = Registry::<Fake>::new();
+        let token = runs.begin("t").unwrap();
+        let process = Arc::new(Fake {
+            fail: true,
+            ..Fake::default()
+        });
+        assert!(!runs.attach("t", token, &process));
+        assert!(runs.cancel("t"));
+        assert_eq!(kills(&process), 1);
+        runs.end("t", token);
+    }
+
+    fn entered() -> &'static std::sync::Barrier {
+        static B: OnceLock<std::sync::Barrier> = OnceLock::new();
+        B.get_or_init(|| std::sync::Barrier::new(2))
+    }
+
+    fn released() -> &'static std::sync::Barrier {
+        static B: OnceLock<std::sync::Barrier> = OnceLock::new();
+        B.get_or_init(|| std::sync::Barrier::new(2))
+    }
+
+    /// An availability check that holds the run until the test lets it go.
+    fn held_status() -> PythonStatus {
+        entered().wait();
+        released().wait();
+        available()
+    }
+
+    #[test]
+    fn dropping_the_guard_while_the_check_runs_frees_the_chat() {
+        let id = unique_thread();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let guard = begin_run(&id).unwrap();
+            let run = run_python_checked(missing_spec(), &guard, "print(1)", &[], held_status);
+            let in_check = tokio::task::spawn_blocking(|| entered().wait());
+            tokio::select! {
+                _ = run => panic!("the run cannot finish while its check is held"),
+                _ = in_check => {}
+            }
+            // The run's future is gone; now its guard goes too, while the
+            // blocking part is still inside the availability check.
+            drop(guard);
+        });
+        assert!(
+            !lock(&registry().runs).contains_key(&id),
+            "no slot is left behind"
         );
-        assert_eq!(
-            measure_gap(Duration::from_secs(2)),
-            Duration::from_millis(POLL_MS)
-        );
+        let next = begin_run(&id).expect("the chat is free at once");
+        // Let the abandoned run go on: it must stop by itself and leave the
+        // new claim alone.
+        released().wait();
+        let next_token = next.token;
+        // It needs milliseconds; a second of checks covers it.
+        for _ in 0..10 {
+            {
+                let runs = lock(&registry().runs);
+                let slot = runs.get(&id).expect("the new claim stays");
+                assert_eq!(slot.token, next_token);
+                assert!(slot.process.is_none() && !slot.cancelled);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        drop(next);
+        assert!(!lock(&registry().runs).contains_key(&id));
+        drop(rt);
     }
 
     #[test]

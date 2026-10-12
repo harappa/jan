@@ -5226,6 +5226,7 @@ dependencies = [
  "base64 0.22.1",
  "glob",
  "ignore",
+ "log",
  "nix 0.30.1",
  "percent-encoding",
  "png 0.17.16",
