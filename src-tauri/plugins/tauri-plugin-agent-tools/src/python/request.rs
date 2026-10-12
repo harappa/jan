@@ -57,6 +57,36 @@ fn quote_command_path(path: &Path) -> String {
     format!("'{}'", path_string(path).replace('\'', r"'\''"))
 }
 
+/// Where the host's `nice` is. On Unix the sandbox shows the system folders, and
+/// its environment has no `PATH`, so the full path is used. Windows lowers the
+/// priority with `SetPriorityClass` after the spawn instead.
+#[cfg(not(windows))]
+fn find_nice() -> Option<PathBuf> {
+    ["/usr/bin/nice", "/bin/nice"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+/// Windows has no `nice`; see the Unix version.
+#[cfg(windows)]
+fn find_nice() -> Option<PathBuf> {
+    None
+}
+
+/// The command line: the interpreter reading the script from stdin, prefixed
+/// with `nice -n 10` when there is a `nice`, so a busy script does not slow the
+/// app down. Setting the priority of the process MXC returns would not do on
+/// Unix: that is Bubblewrap's wrapper, which has already started python.
+/// Both paths are quoted: the data folder may contain spaces.
+fn command_line(python: &Path, nice: Option<&Path>) -> String {
+    let python = quote_command_path(python);
+    match nice {
+        Some(nice) => format!("{} -n 10 {python} -I -B -", quote_command_path(nice)),
+        None => format!("{python} -I -B -"),
+    }
+}
+
 /// The sandbox request for one run: the script arrives on stdin, the workspace
 /// is the only writable place, the runtime and inputs are read-only, and there
 /// is no network and no UI.
@@ -65,8 +95,7 @@ fn quote_command_path(path: &Path) -> String {
 /// environment can hold API keys.
 pub fn build_request(spec: &RunSpec) -> ContainerRequest {
     let python = python_executable(&spec.runtime);
-    // The interpreter path is quoted: the data folder may contain spaces.
-    let mut request = ContainerRequest::new(format!("{} -I -B -", quote_command_path(&python)));
+    let mut request = ContainerRequest::new(command_line(&python, find_nice().as_deref()));
     let workspace = path_string(&spec.workspace);
     let inputs = path_string(&spec.inputs);
 
@@ -224,8 +253,75 @@ mod tests {
         } else {
             format!("'{}'", python.to_str().unwrap())
         };
-        assert_eq!(request.command, format!("{quoted} -I -B -"));
+        match find_nice() {
+            // Unix with `nice`: the run starts at niceness 10.
+            Some(nice) => assert_eq!(
+                request.command,
+                format!("'{}' -n 10 {quoted} -I -B -", nice.to_str().unwrap())
+            ),
+            // Windows (priority set with `SetPriorityClass`), or no `nice`.
+            None => assert_eq!(request.command, format!("{quoted} -I -B -")),
+        }
         assert!(request.command.contains("x y"));
+    }
+
+    #[test]
+    fn nice_comes_first_and_is_quoted_like_the_interpreter() {
+        let python = Path::new("data/x y/python");
+        let nice = Path::new("/usr/bin/nice");
+        assert_eq!(
+            command_line(python, Some(nice)),
+            format!(
+                "{} -n 10 {} -I -B -",
+                quote_command_path(nice),
+                quote_command_path(python)
+            )
+        );
+        assert_eq!(
+            command_line(python, None),
+            format!("{} -I -B -", quote_command_path(python))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_never_uses_nice() {
+        assert_eq!(find_nice(), None);
+    }
+
+    /// The sandbox environment has no `PATH`, so `nice` is named by its full
+    /// path, and only when the host has it.
+    #[cfg(unix)]
+    #[test]
+    fn nice_is_an_absolute_executable_when_found() {
+        if let Some(nice) = find_nice() {
+            assert!(nice.is_absolute() && nice.is_file(), "{nice:?}");
+        }
+    }
+
+    /// The prefix really runs the command at niceness +10 through `sh -c`.
+    #[cfg(unix)]
+    #[test]
+    fn unix_nice_prefix_runs_through_sh() {
+        let Some(nice) = find_nice() else {
+            eprintln!("skipping: no nice on this host");
+            return;
+        };
+        let niceness = |line: &str| -> i32 {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(line)
+                .output()
+                .expect("sh");
+            assert!(out.status.success(), "{line}");
+            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+        };
+        let quoted = quote_command_path(&nice);
+        let base = niceness(&quoted);
+        assert_eq!(
+            niceness(&format!("{quoted} -n 10 {quoted}")),
+            (base + 10).min(19)
+        );
     }
 
     #[cfg(windows)]
