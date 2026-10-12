@@ -208,6 +208,10 @@ function ThreadDetail() {
   // uses this to keep the stop button available. Not derived from busyThreads,
   // which is also set while attachments are embedded (nothing to cancel there).
   const [toolsRunning, setToolsRunning] = useState(false)
+  // Counts tool loops started. A loop the user stopped can still be waiting on
+  // its in-flight tool when the next loop starts; once superseded it must leave
+  // the shared state (controller, flag, busy, approvals) to the newer loop.
+  const toolLoopGeneration = useRef(0)
 
   // Approval promises started in onToolCall (so the popup appears immediately)
   // and awaited by the onFinish execution loop, keyed by toolCallId. Executing
@@ -528,10 +532,25 @@ function ThreadDetail() {
       // auto-resubmit (sendAutomaticallyWhen) fires. Approval is requested
       // earlier in onToolCall (popup appears without waiting for this callback);
       // we await that already-started promise here rather than prompting again.
+      // A stopped turn must not run its tool calls (the stop handler already
+      // released their approvals); the calls are left without a result and the
+      // transport marks them as errored when the history is sent again.
+      const toolsToRun = isAbort ? [] : sessionData.tools
       const loopController = new AbortController()
       toolCallAbortController.current = loopController
       const signal = loopController.signal
+      const generation = ++toolLoopGeneration.current
       setToolsRunning(true)
+
+      const finishToolLoop = () => {
+        if (toolLoopGeneration.current !== generation) return
+        useToolCallRuntime.getState().settleRemaining()
+        sessionData.tools = []
+        toolApprovalPromises.current.clear()
+        setToolsRunning(false)
+        toolCallAbortController.current = null
+        useAppState.getState().setThreadBusy(threadId, false)
+      }
 
       const ragToolNames = useAppState.getState().ragToolNames
       const mcpToolNames = useAppState.getState().mcpToolNames
@@ -543,10 +562,10 @@ function ThreadDetail() {
       // Tools run one at a time below, so the rest are genuinely queued.
       useToolCallRuntime
         .getState()
-        .enqueue(sessionData.tools.map((tc) => tc.toolCallId))
+        .enqueue(toolsToRun.map((tc) => tc.toolCallId))
 
       ;(async () => {
-        for (const toolCall of sessionData.tools) {
+        for (const toolCall of toolsToRun) {
           if (signal.aborted) {
             break
           }
@@ -661,28 +680,12 @@ function ThreadDetail() {
           }
         }
 
-        useToolCallRuntime.getState().settleRemaining()
-        sessionData.tools = []
-        toolApprovalPromises.current.clear()
-        // A newer loop (after a thread switch) owns the flag by then.
-        if (toolCallAbortController.current === loopController) {
-          setToolsRunning(false)
-        }
-        toolCallAbortController.current = null
-        useAppState.getState().setThreadBusy(threadId, false)
+        finishToolLoop()
       })().catch((error) => {
         if (error.name !== 'AbortError') {
           console.error('Tool call error:', error)
         }
-        useToolCallRuntime.getState().settleRemaining()
-        sessionData.tools = []
-        toolApprovalPromises.current.clear()
-        // A newer loop (after a thread switch) owns the flag by then.
-        if (toolCallAbortController.current === loopController) {
-          setToolsRunning(false)
-        }
-        toolCallAbortController.current = null
-        useAppState.getState().setThreadBusy(threadId, false)
+        finishToolLoop()
       })
 
       if (!isAbort) {
@@ -791,10 +794,16 @@ function ThreadDetail() {
   // release approvals waiting on this thread, as the thread-switch cleanup does.
   const handleStop = useCallback(() => {
     stop()
-    if (toolCallAbortController.current) {
-      toolCallAbortController.current.abort()
-      toolApprovalPromises.current.clear()
-      useToolApprovalRequests.getState().clearPendingForThread(threadId)
+    // Also while streaming: a dialog opened by onToolCall would otherwise keep
+    // the loop that starts at the end of the stream waiting on it.
+    toolApprovalPromises.current.clear()
+    useToolApprovalRequests.getState().clearPendingForThread(threadId)
+    const controller = toolCallAbortController.current
+    if (controller) {
+      controller.abort()
+      // Settle the queue of the loop being stopped now: once a newer loop has
+      // started, this one no longer touches the shared runtime state.
+      useToolCallRuntime.getState().settleRemaining()
       setToolsRunning(false)
     }
   }, [stop, threadId])
@@ -1012,6 +1021,11 @@ function ThreadDetail() {
     // Stable ref object (never reassigned) — capture for the cleanup closure.
     const approvalPromises = toolApprovalPromises.current
     return () => {
+      // The loop's own cleanup is skipped once a loop on another thread has
+      // superseded it, so release the busy mark of the thread we leave here.
+      if (toolCallAbortController.current) {
+        useAppState.getState().setThreadBusy(threadId, false)
+      }
       toolCallAbortController.current?.abort()
       toolCallAbortController.current = null
       setToolsRunning(false)
