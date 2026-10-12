@@ -73,6 +73,7 @@
     "saveAs": "名前を付けて保存…",
     "saved": "{{path}} に保存しました",
     "saveFailed": "保存できませんでした: {{reason}}",
-    "moreFiles": "ほか {{count}} 件"
+    "moreFiles": "ほか {{count}} 件",
+    "truncated": "出力を省略しました"
   }
 }

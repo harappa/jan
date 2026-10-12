@@ -103,6 +103,48 @@ describe('PythonWidget', () => {
     expect(screen.queryByText('tools:toolCall.terminated')).toBeNull()
   })
 
+  it.each([
+    ['the disk limit', '[stopped: the run used more than 2 GB of disk space]'],
+    [
+      'the workspace limit',
+      '[stopped: the run wrote more than 1 GB to the workspace]',
+    ],
+    ['a user cancel', '[stopped: cancelled by the user]'],
+  ])('flags a run stopped by %s', (_, note) => {
+    renderDone(`partial\n[terminated by signal]\n${note}`)
+    expect(screen.getByText(note)).toBeInTheDocument()
+    expect(screen.getByText('tools:toolCall.terminated')).toBeInTheDocument()
+    expect(screen.queryByText('tools:python.truncated')).toBeNull()
+  })
+
+  it('badges output that was truncated, without calling the run stopped', () => {
+    renderDone('tail\n[exit 0]\n[output truncated at 65536 of 90000 bytes]')
+    expect(screen.getByText('tools:python.truncated')).toBeInTheDocument()
+    expect(screen.queryByText('tools:toolCall.terminated')).toBeNull()
+  })
+
+  it('shows both badges when the run was stopped and its output truncated', () => {
+    renderDone(
+      'tail\n[terminated by signal]\n[timed out after 30 s: split the work or pass a larger timeout, up to 300]\n[output truncated at 65536 of 90000 bytes]'
+    )
+    expect(screen.getByText('tools:python.truncated')).toBeInTheDocument()
+    expect(screen.getByText('tools:toolCall.terminated')).toBeInTheDocument()
+  })
+
+  it('keeps the output of a call that also carries an error text', () => {
+    render(
+      <PythonWidget
+        bar={bar}
+        state="output-error"
+        output={'partial output\n[exit 2]'}
+        errorText="Tool execution failed"
+      />
+    )
+    expect(screen.getByText('partial output')).toBeInTheDocument()
+    expect(screen.queryByText('Tool execution failed')).toBeNull()
+    expect(screen.getByTestId('python-status-error')).toBeInTheDocument()
+  })
+
   it('treats a setup failure as an error', () => {
     renderDone('ERROR: the runtime is not installed')
     expect(
@@ -189,6 +231,20 @@ describe('PythonWidget', () => {
         'out/report.csv'
       )
       expect(hoisted.toast.error).not.toHaveBeenCalled()
+    })
+
+    it('describes a save error that carries no message', async () => {
+      hoisted.savePythonFile.mockRejectedValue({ code: 13 })
+      renderDone(fileResult)
+
+      fireEvent.click(screen.getAllByText('tools:python.saveAs')[0])
+
+      await waitFor(() =>
+        expect(hoisted.toast.error).toHaveBeenCalledWith(
+          'tools:python.saveFailed ' +
+            JSON.stringify({ reason: JSON.stringify({ code: 13 }) })
+        )
+      )
     })
 
     it('says nothing when the user cancels the dialog', async () => {

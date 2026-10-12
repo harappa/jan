@@ -10,7 +10,7 @@ import { Shimmer } from '@/components/ai-elements/shimmer'
 import { Button } from '@/components/ui/button'
 import { useThreads } from '@/hooks/useThreads'
 import { useTranslation } from '@/i18n/react-i18next-compat'
-import { parsePythonOutput, savePythonFile } from '@/lib/pythonTool'
+import { messageOf, parsePythonOutput, savePythonFile } from '@/lib/pythonTool'
 import { isToolRunning, type ToolCallBar } from '@/lib/toolPresentation'
 import { cn, formatBytes } from '@/lib/utils'
 import { Caret } from './ToolBar'
@@ -21,20 +21,15 @@ const FOLD_AFTER_LINES = 15
 /** A signal, timeout or limit stopped the run: it did not finish by itself. */
 const STOPPED_NOTE = /^\[(terminated by signal|timed out|stopped:)/
 
+/** The program printed more than the result keeps: only its end is shown. */
+const isTruncationNote = (note: string) => note.startsWith('[output truncated')
+
 const outputText = (output: unknown): string =>
   typeof output === 'string'
     ? output
     : typeof (output as { content?: unknown })?.content === 'string'
       ? (output as { content: string }).content
       : ''
-
-// The save rejects with whatever Rust returned (usually a string) or an Error.
-const reasonOf = (error: unknown): string => {
-  if (error instanceof Error) return error.message
-  if (typeof error === 'string') return error
-  const message = (error as { message?: unknown } | null)?.message
-  return typeof message === 'string' ? message : String(error)
-}
 
 const formatSize = (bytes: number) =>
   formatBytes(bytes, { decimals: (_, unit) => (unit === 'B' ? 0 : 1) })
@@ -103,10 +98,10 @@ const FileList = ({ files, moreFiles, threadId }: FilesProps) => {
       try {
         const saved = await savePythonFile(threadId, path)
         // null: the user closed the dialog, which needs no answer.
-        if (saved !== null)
+        if (typeof saved === 'string')
           toast.success(t('tools:python.saved', { path: saved }))
       } catch (error) {
-        toast.error(t('tools:python.saveFailed', { reason: reasonOf(error) }))
+        toast.error(t('tools:python.saveFailed', { reason: messageOf(error) }))
       } finally {
         inFlight.current.delete(path)
         setSaving(new Set(inFlight.current))
@@ -180,9 +175,10 @@ export const PythonWidget = memo(
       [output]
     )
 
-    const body = result?.body || (errorText ? outputText(errorText) : '')
+    const body = result?.body || errorText || ''
     const notes = result?.notes ?? []
     const stopped = notes.some((note) => STOPPED_NOTE.test(note))
+    const truncated = notes.some(isTruncationNote)
     const exitCode = result?.exitCode
     // A failure to set up the run has no exit code and no stop marker; it is
     // reported as `ERROR: ...` in the body.
@@ -208,8 +204,13 @@ export const PythonWidget = memo(
               />
             </span>
           )}
-          {(stopped || exitCode !== undefined) && (
+          {(stopped || truncated || exitCode !== undefined) && (
             <span className="ml-auto flex shrink-0 items-center gap-1.5">
+              {truncated && (
+                <span className="rounded bg-muted px-1.5 py-0.5">
+                  {t('tools:python.truncated')}
+                </span>
+              )}
               {stopped && (
                 <span className="rounded bg-destructive/10 px-1.5 py-0.5 text-destructive">
                   {t('tools:toolCall.terminated')}

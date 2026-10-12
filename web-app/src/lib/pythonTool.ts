@@ -82,7 +82,7 @@ export type { PythonAttachment }
 
 export type PythonResult = { content: string; isError: boolean }
 
-function messageOf(error: unknown): string {
+export function messageOf(error: unknown): string {
   if (error instanceof Error) return error.message
   if (
     error &&
@@ -90,6 +90,13 @@ function messageOf(error: unknown): string {
     typeof (error as { message?: unknown }).message === 'string'
   ) {
     return (error as { message: string }).message
+  }
+  if (error && typeof error === 'object') {
+    try {
+      return JSON.stringify(error)
+    } catch {
+      // Fall through: circular or otherwise unserialisable.
+    }
   }
   return String(error)
 }

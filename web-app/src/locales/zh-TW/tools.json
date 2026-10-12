@@ -73,6 +73,7 @@
     "saveAs": "Save as…",
     "saved": "Saved to {{path}}",
     "saveFailed": "Could not save: {{reason}}",
-    "moreFiles": "{{count}} more files"
+    "moreFiles": "{{count}} more files",
+    "truncated": "Output truncated"
   }
 }
