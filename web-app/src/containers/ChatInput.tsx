@@ -145,6 +145,9 @@ type ChatInputProps = {
   ) => void
   onStop?: () => void
   chatStatus?: ChatStatus
+  // True while the caller runs client-side tool calls after the stream has
+  // ended (chatStatus is already 'ready'), so the stop button stays available.
+  toolsRunning?: boolean
   // Overrides the conversation scope this input belongs to — both its message
   // queue and its pending attachments (default: useThreads' currentThreadId).
   // Callers outside the general chat (e.g. Cowork, keyed by session id) pass
@@ -254,6 +257,7 @@ const ChatInput = memo(function ChatInput({
   onSubmit,
   onStop,
   chatStatus,
+  toolsRunning,
   scopeKey,
   ownsToolSet = true,
   surfaceControls,
@@ -2034,7 +2038,8 @@ const ChatInput = memo(function ChatInput({
     // If hasMmproj is false or no images found, allow normal text pasting to continue
   }
 
-  const isStreaming = chatStatus === 'submitted' || chatStatus === 'streaming'
+  const isStreaming =
+    chatStatus === 'submitted' || chatStatus === 'streaming' || !!toolsRunning
 
   return (
     <div className="relative">

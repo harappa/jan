@@ -193,9 +193,10 @@ vi.mock('@/containers/DropdownModelProvider', () => ({
 }))
 
 vi.mock('@/containers/ChatInput', () => ({
-  default: ({ onSubmit, onStop, chatStatus }: any) => (
+  default: ({ onSubmit, onStop, chatStatus, toolsRunning }: any) => (
     <div data-testid="chat-input">
       <span data-testid="chat-status">{chatStatus}</span>
+      <span data-testid="tools-running">{String(!!toolsRunning)}</span>
       <button
         data-testid="chat-send"
         onClick={() => onSubmit('hello world', undefined)}
@@ -370,6 +371,7 @@ vi.mock('@/hooks/use-chat', () => ({
   useChat: (_args: any) => {
     ;(h as any).capturedOnFinish = _args?.onFinish
     ;(h as any).capturedOnToolCall = _args?.onToolCall
+    ;(h as any).capturedSendAutomaticallyWhen = _args?.sendAutomaticallyWhen
     return {
       messages: h.chatState.messages,
       status: h.chatState.status,
@@ -1269,6 +1271,154 @@ describe('ThreadDetail route', () => {
         expect(runtime.queue).toEqual([])
         expect(runtime.timings['tcA']?.startedAt).toBeUndefined()
         expect(runtime.timings['tcA']?.endedAt).toBeDefined()
+      })
+    })
+
+    // The tool loop runs after the stream ended (status 'ready'), so ChatInput
+    // needs its own signal to offer the stop button, and stopping has to abort
+    // the loop itself: the SDK's stop() only knows about the stream.
+    describe('stopping a running tool loop', () => {
+      const toolsRunningFlag = () =>
+        screen.getByTestId('tools-running').textContent
+
+      // Executor for tool `tcA` hangs until released; others return at once.
+      const hangingExecutor = () => {
+        const started: string[] = []
+        const releases: Record<string, () => void> = {}
+        const callTool = vi.fn(({ arguments: args }: any) => {
+          started.push(args.id)
+          if (args.id === 'tcA') {
+            return new Promise((resolve) => {
+              releases[args.id] = () => resolve({ error: '', content: [] })
+            })
+          }
+          return Promise.resolve({ error: '', content: [] })
+        })
+        hub.mcp = () => ({ callTool }) as never
+        return { started, releases }
+      }
+
+      const arriveWithIds = async (...ids: string[]) => {
+        for (const id of ids) {
+          await act(async () => {
+            await (h as any).capturedOnToolCall({
+              toolCall: { toolCallId: id, toolName: 'fetch', input: { id } },
+            })
+          })
+        }
+      }
+
+      it('reports the loop as running from its start until it drains', async () => {
+        h.appStateState.mcpToolNames = new Set(['fetch'])
+        const { releases } = hangingExecutor()
+        renderComponent()
+        expect(toolsRunningFlag()).toBe('false')
+
+        await arriveWithIds('tcA')
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+        expect(toolsRunningFlag()).toBe('true')
+
+        await act(async () => {
+          releases.tcA()
+        })
+        expect(toolsRunningFlag()).toBe('false')
+      })
+
+      it('stops the loop: later calls do not run and approvals are released', async () => {
+        h.appStateState.mcpToolNames = new Set(['fetch'])
+        const { started, releases } = hangingExecutor()
+        renderComponent()
+        await arriveWithIds('tcA', 'tcB')
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+        expect(started).toEqual(['tcA'])
+        expect(toolsRunningFlag()).toBe('true')
+
+        await act(async () => {
+          screen.getByTestId('chat-stop').click()
+        })
+
+        // The existing stream stop is still invoked, the thread's pending
+        // approvals are released and the running state is cleared at once.
+        expect(h.mockStop).toHaveBeenCalledTimes(1)
+        expect(h.toolApprovalState.clearPendingForThread).toHaveBeenCalledWith(
+          'thread-1'
+        )
+        expect(toolsRunningFlag()).toBe('false')
+
+        // The in-flight call finishes afterwards; tcB must never start.
+        await act(async () => {
+          releases.tcA()
+        })
+        expect(started).toEqual(['tcA'])
+        expect(
+          h.mockAddToolOutput.mock.calls.map((c: any[]) => c[0].toolCallId)
+        ).not.toContain('tcB')
+        expect(h.appStateState.setThreadBusy).toHaveBeenLastCalledWith(
+          'thread-1',
+          false
+        )
+        expect(toolsRunningFlag()).toBe('false')
+      })
+
+      it('does not ask the model for a follow-up after the stop', async () => {
+        h.appStateState.mcpToolNames = new Set(['fetch'])
+        const { releases } = hangingExecutor()
+        renderComponent()
+        const sendWhen = (
+          h as {
+            capturedSendAutomaticallyWhen?: (arg: {
+              messages: unknown[]
+            }) => boolean
+          }
+        ).capturedSendAutomaticallyWhen
+        expect(sendWhen).toBeTypeOf('function')
+
+        await arriveWithIds('tcA')
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+        await act(async () => {
+          screen.getByTestId('chat-stop').click()
+        })
+        await act(async () => {
+          releases.tcA()
+        })
+
+        const completedToolTurn = [
+          {
+            id: 'a-tc',
+            role: 'assistant',
+            parts: [
+              {
+                type: 'tool-fetch',
+                state: 'output-available',
+                toolCallId: 'tcA',
+                input: {},
+                output: [],
+              },
+            ],
+          },
+        ]
+        expect(sendWhen!({ messages: completedToolTurn })).toBe(false)
+      })
+
+      it('releases the thread approvals when the thread is left mid-loop', async () => {
+        h.appStateState.mcpToolNames = new Set(['fetch'])
+        hangingExecutor()
+        const { unmount } = renderComponent()
+        await arriveWithIds('tcA')
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+        expect(toolsRunningFlag()).toBe('true')
+        unmount()
+        expect(h.toolApprovalState.clearPendingForThread).toHaveBeenCalledWith(
+          'thread-1'
+        )
       })
     })
 

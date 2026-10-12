@@ -478,6 +478,33 @@ describe('ChatInput', () => {
     expect(clicked).toBeGreaterThanOrEqual(0) // smoke: no crash
   })
 
+  // A client-side tool loop runs after the stream ended, so the SDK status is
+  // already 'ready'; the caller says the loop is running via `toolsRunning`.
+  describe('while a tool call is running (chat status ready)', () => {
+    it('shows the stop button instead of the send button', () => {
+      promptState = ''
+      renderInput({ chatStatus: 'ready', toolsRunning: true })
+      expect(screen.getByTestId('stop-message-button')).toBeInTheDocument()
+      expect(
+        document.querySelector('[data-test-id="send-message-button"]')
+      ).toBeNull()
+    })
+
+    it('calls onStop when the stop button is clicked', () => {
+      promptState = ''
+      const onStop = vi.fn()
+      renderInput({ chatStatus: 'ready', toolsRunning: true, onStop })
+      fireEvent.click(screen.getByTestId('stop-message-button'))
+      expect(onStop).toHaveBeenCalledTimes(1)
+    })
+
+    it('shows no stop button when the prop is absent', () => {
+      promptState = ''
+      renderInput({ chatStatus: 'ready' })
+      expect(screen.queryByTestId('stop-message-button')).toBeNull()
+    })
+  })
+
   it('queues the message when streaming with a currentThreadId', async () => {
     promptState = 'queued msg'
     const onSubmit = vi.fn()

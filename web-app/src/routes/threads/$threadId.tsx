@@ -203,6 +203,11 @@ function ThreadDetail() {
 
   // AbortController for cancelling tool calls
   const toolCallAbortController = useRef<AbortController | null>(null)
+  // True from the start of the tool loop to its end. The loop runs in onFinish,
+  // after the stream ended, so the SDK status is 'ready' meanwhile; ChatInput
+  // uses this to keep the stop button available. Not derived from busyThreads,
+  // which is also set while attachments are embedded (nothing to cancel there).
+  const [toolsRunning, setToolsRunning] = useState(false)
 
   // Approval promises started in onToolCall (so the popup appears immediately)
   // and awaited by the onFinish execution loop, keyed by toolCallId. Executing
@@ -523,8 +528,10 @@ function ThreadDetail() {
       // auto-resubmit (sendAutomaticallyWhen) fires. Approval is requested
       // earlier in onToolCall (popup appears without waiting for this callback);
       // we await that already-started promise here rather than prompting again.
-      toolCallAbortController.current = new AbortController()
-      const signal = toolCallAbortController.current.signal
+      const loopController = new AbortController()
+      toolCallAbortController.current = loopController
+      const signal = loopController.signal
+      setToolsRunning(true)
 
       const ragToolNames = useAppState.getState().ragToolNames
       const mcpToolNames = useAppState.getState().mcpToolNames
@@ -657,6 +664,10 @@ function ThreadDetail() {
         useToolCallRuntime.getState().settleRemaining()
         sessionData.tools = []
         toolApprovalPromises.current.clear()
+        // A newer loop (after a thread switch) owns the flag by then.
+        if (toolCallAbortController.current === loopController) {
+          setToolsRunning(false)
+        }
         toolCallAbortController.current = null
         useAppState.getState().setThreadBusy(threadId, false)
       })().catch((error) => {
@@ -666,6 +677,10 @@ function ThreadDetail() {
         useToolCallRuntime.getState().settleRemaining()
         sessionData.tools = []
         toolApprovalPromises.current.clear()
+        // A newer loop (after a thread switch) owns the flag by then.
+        if (toolCallAbortController.current === loopController) {
+          setToolsRunning(false)
+        }
         toolCallAbortController.current = null
         useAppState.getState().setThreadBusy(threadId, false)
       })
@@ -770,6 +785,19 @@ function ThreadDetail() {
   // banner is up — regenerate/reload restarts the turn anyway.
   const hasBannerError = !!(oomError || backendError || contextLimitError)
   const effectiveStatus = hasBannerError ? 'ready' : status
+
+  // The SDK's stop() only ends the stream. While the tool loop runs, also abort
+  // it (an aborted controller keeps followUpMessage from resubmitting) and
+  // release approvals waiting on this thread, as the thread-switch cleanup does.
+  const handleStop = useCallback(() => {
+    stop()
+    if (toolCallAbortController.current) {
+      toolCallAbortController.current.abort()
+      toolApprovalPromises.current.clear()
+      useToolApprovalRequests.getState().clearPendingForThread(threadId)
+      setToolsRunning(false)
+    }
+  }, [stop, threadId])
 
   // Global disabled-tools set; re-run the effect below when it changes.
   const disabledTools = useToolAvailable((state) => state.disabledTools)
@@ -986,6 +1014,7 @@ function ThreadDetail() {
     return () => {
       toolCallAbortController.current?.abort()
       toolCallAbortController.current = null
+      setToolsRunning(false)
       approvalPromises.clear()
       useToolApprovalRequests.getState().clearPendingForThread(threadId)
       // Drop per-thread timing/progress/diff state from the shared runtime
@@ -2002,8 +2031,9 @@ function ThreadDetail() {
           <ChatInput
             model={threadModel}
             onSubmit={handleSubmit}
-            onStop={stop}
+            onStop={handleStop}
             chatStatus={effectiveStatus}
+            toolsRunning={toolsRunning}
           />
         </div>
       </div>
