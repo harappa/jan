@@ -232,11 +232,10 @@ impl Drop for RunGuard {
     }
 }
 
-#[cfg(all(test, feature = "tauri"))]
 impl RunGuard {
-    /// Whether `cancel` (or a newer claim) has ended this claim; lets the
-    /// command tests (which need the `tauri` feature) see that it was cancelled.
-    pub(crate) fn is_cancelled(&self) -> bool {
+    /// Whether `cancel` (or a newer claim) has ended this claim. The setup steps
+    /// before the spawn check it so that a cancelled run never starts.
+    pub fn is_cancelled(&self) -> bool {
         registry().is_cancelled(&self.thread_id, self.token)
     }
 }

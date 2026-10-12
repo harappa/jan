@@ -76,13 +76,13 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
             commands::stop_session_monitors,
             commands::cancel_thread_bash,
             #[cfg(feature = "python-tool")]
-            commands::python_status,
+            python::commands::python_status,
             #[cfg(feature = "python-tool")]
-            commands::python_run,
+            python::commands::python_run,
             #[cfg(feature = "python-tool")]
-            commands::python_cancel,
+            python::commands::python_cancel,
             #[cfg(feature = "python-tool")]
-            commands::python_save_file,
+            python::commands::python_save_file,
             commands::preview_register_root,
             commands::preview_unregister_root
         ])

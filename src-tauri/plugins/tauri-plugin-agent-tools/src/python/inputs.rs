@@ -36,11 +36,14 @@ pub struct StageReport {
     pub skipped: Vec<(String, String)>,
 }
 
+/// `<data_folder>/agent-workspace/inputs`: one folder per thread inside.
+pub fn inputs_root(data_folder: &Path) -> PathBuf {
+    permanent_store(data_folder).join(INPUTS)
+}
+
 /// `<data_folder>/agent-workspace/inputs/<thread segment>`.
 pub fn inputs_dir(data_folder: &Path, thread_id: &str) -> Result<PathBuf, String> {
-    Ok(permanent_store(data_folder)
-        .join(INPUTS)
-        .join(thread_segment(thread_id)?))
+    Ok(inputs_root(data_folder).join(thread_segment(thread_id)?))
 }
 
 const NOT_READABLE: &str = "not a readable file";

@@ -491,25 +491,84 @@ async fn ensure_workspace_at(dir: PathBuf) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Pauses before each further attempt at removing a folder. On Windows a process
+/// that was just killed (a python run stopped by a chat delete) can still hold
+/// files for a moment; about 1.5 s in all. Elsewhere a failure is final.
+#[cfg(windows)]
+const REMOVE_RETRY_DELAYS: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(400),
+    std::time::Duration::from_millis(800),
+];
+#[cfg(not(windows))]
+const REMOVE_RETRY_DELAYS: &[std::time::Duration] = &[];
+
+/// Run `op` until it succeeds, pausing `delays[i]` before attempt `i + 2`.
+/// Returns the last error once the delays are used up.
+async fn retry_io<F, Fut>(delays: &[std::time::Duration], mut op: F) -> std::io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<()>>,
+{
+    let mut pauses = delays.iter();
+    loop {
+        match op().await {
+            Ok(()) => return Ok(()),
+            Err(e) => match pauses.next() {
+                Some(pause) => tokio::time::sleep(*pause).await,
+                None => return Err(e),
+            },
+        }
+    }
+}
+
+/// `remove_dir_all` that treats a missing folder as done and retries per `delays`.
+async fn remove_dir_retrying(dir: &Path, delays: &[std::time::Duration]) -> std::io::Result<()> {
+    retry_io(delays, || async {
+        match tokio::fs::remove_dir_all(dir).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    })
+    .await
+}
+
 /// Delete a thread's sandbox (and, with the python tool, its staged inputs).
 /// Idempotent: a missing sandbox is Ok.
+///
+/// Both removals are attempted even if the first fails (a stuck sandbox must
+/// not keep a deleted chat's attachments on disk); the first error is returned.
 pub async fn remove_thread_workspace(
     jan_data_folder: &Path,
     thread_id: &str,
 ) -> Result<(), String> {
-    remove_workspace_at(thread_workspace(jan_data_folder, thread_id)?, thread_id).await?;
+    remove_thread_workspace_with(jan_data_folder, thread_id, REMOVE_RETRY_DELAYS).await
+}
+
+async fn remove_thread_workspace_with(
+    jan_data_folder: &Path,
+    thread_id: &str,
+    delays: &[std::time::Duration],
+) -> Result<(), String> {
+    let sandbox = remove_workspace_at_with(
+        thread_workspace(jan_data_folder, thread_id)?,
+        thread_id,
+        delays,
+    )
+    .await;
     // The python tool stages a thread's attachments beside the workspaces, not
     // inside them, so they need their own removal. Idempotent like the above.
     #[cfg(feature = "python-tool")]
-    {
-        let inputs = crate::python::inputs::inputs_dir(jan_data_folder, thread_id)?;
-        match tokio::fs::remove_dir_all(&inputs).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("ERROR: {e}")),
-        }
-    }
-    Ok(())
+    let inputs = {
+        let dir = crate::python::inputs::inputs_dir(jan_data_folder, thread_id)?;
+        remove_dir_retrying(&dir, delays)
+            .await
+            .map_err(|e| format!("ERROR: {e}"))
+    };
+    #[cfg(not(feature = "python-tool"))]
+    let inputs = Ok(());
+    sandbox.and(inputs)
 }
 
 /// Delete a Cowork session's sandbox. Idempotent: a missing sandbox is Ok.
@@ -521,12 +580,18 @@ pub async fn remove_session_workspace(
 }
 
 async fn remove_workspace_at(dir: PathBuf, id: &str) -> Result<(), String> {
+    remove_workspace_at_with(dir, id, REMOVE_RETRY_DELAYS).await
+}
+
+async fn remove_workspace_at_with(
+    dir: PathBuf,
+    id: &str,
+    delays: &[std::time::Duration],
+) -> Result<(), String> {
     crate::tools::appcontainer::release(&dir);
-    match tokio::fs::remove_dir_all(&dir).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("ERROR: {e}")),
-    }
+    remove_dir_retrying(&dir, delays)
+        .await
+        .map_err(|e| format!("ERROR: {e}"))?;
     // Wipe the host-temp scratch keyed to the same id.
     let _ = remove_scratch_dir(id).await;
     Ok(())
@@ -543,7 +608,12 @@ pub async fn sweep_thread_workspaces(
     jan_data_folder: &Path,
     keep: &[String],
 ) -> Result<usize, String> {
-    sweep_workspaces_in(threads_dir(jan_data_folder), keep).await
+    let removed = sweep_workspaces_in(threads_dir(jan_data_folder), keep).await?;
+    // Attachments the python tool staged for threads that no longer exist. Same
+    // fail-safe for an empty `keep`; the count stays the number of sandboxes.
+    #[cfg(feature = "python-tool")]
+    sweep_inputs_in(crate::python::inputs::inputs_root(jan_data_folder), keep).await;
+    Ok(removed)
 }
 
 /// Delete every Cowork session sandbox whose id is not in `keep`.
@@ -555,6 +625,36 @@ pub async fn sweep_session_workspaces(
     keep: &[String],
 ) -> Result<usize, String> {
     sweep_workspaces_in(sessions_dir(jan_data_folder), keep).await
+}
+
+/// The directory names that belong to the threads in `keep`. A directory is
+/// named by the sanitized id, so a raw id would not match its own folder.
+fn kept_segments(keep: &[String]) -> std::collections::HashSet<String> {
+    keep.iter()
+        .filter_map(|id| thread_segment(id).ok())
+        .collect()
+}
+
+/// Remove the per-thread folders under `dir` (staged python inputs) whose thread
+/// is not in `keep`. Best effort: a folder that cannot be removed stays for the
+/// next sweep.
+#[cfg(feature = "python-tool")]
+async fn sweep_inputs_in(dir: PathBuf, keep: &[String]) {
+    if keep.is_empty() {
+        return;
+    }
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return;
+    };
+    let keep = kept_segments(keep);
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !keep.contains(&name) {
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
+        }
+    }
 }
 
 async fn sweep_workspaces_in(dir: PathBuf, keep: &[String]) -> Result<usize, String> {
@@ -570,10 +670,7 @@ async fn sweep_workspaces_in(dir: PathBuf, keep: &[String]) -> Result<usize, Str
     };
     // Compare against sanitized ids: the directory name is the sanitized form,
     // so a raw id would fail to match its own sandbox and delete a live one.
-    let keep: std::collections::HashSet<String> = keep
-        .iter()
-        .filter_map(|id| thread_segment(id).ok())
-        .collect();
+    let keep = kept_segments(keep);
     let mut removed = 0;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -869,6 +966,95 @@ mod tests {
         assert!(!inputs.exists());
         remove_thread_workspace(&data, "t1").await.unwrap();
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A stuck sandbox must not keep the deleted chat's attachments on disk, and
+    /// the failure is still reported.
+    #[cfg(feature = "python-tool")]
+    #[tokio::test]
+    async fn inputs_are_removed_even_when_the_sandbox_cannot_be_removed() {
+        use crate::python::inputs::inputs_dir;
+        let data = unique_data_folder();
+        // A file where the sandbox folder should be: removing it as a folder fails.
+        let sandbox = thread_workspace(&data, "t1").unwrap();
+        std::fs::create_dir_all(sandbox.parent().unwrap()).unwrap();
+        std::fs::write(&sandbox, "not a folder").unwrap();
+        let inputs = inputs_dir(&data, "t1").unwrap();
+        std::fs::create_dir_all(&inputs).unwrap();
+        std::fs::write(inputs.join("data.csv"), "a,b").unwrap();
+
+        let result = remove_thread_workspace_with(&data, "t1", &[]).await;
+        assert!(result.is_err(), "the sandbox failure must be reported");
+        assert!(result.unwrap_err().starts_with("ERROR: "));
+        assert!(!inputs.exists(), "the inputs must be removed regardless");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// The startup sweep also drops staged inputs of threads that are gone.
+    #[cfg(feature = "python-tool")]
+    #[tokio::test]
+    async fn sweep_removes_orphaned_python_inputs_and_keeps_live_ones() {
+        use crate::python::inputs::inputs_dir;
+        let data = unique_data_folder();
+        for id in ["live", "dead", "also-dead"] {
+            let dir = inputs_dir(&data, id).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("a.csv"), "x").unwrap();
+        }
+        // Inputs whose thread has no sandbox (any more) are swept too.
+        ensure_thread_workspace(&data, "live").await.unwrap();
+
+        let removed = sweep_thread_workspaces(&data, &["live".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            removed, 0,
+            "the count is of sandboxes, and there was none to remove"
+        );
+        assert!(inputs_dir(&data, "live").unwrap().join("a.csv").is_file());
+        assert!(!inputs_dir(&data, "dead").unwrap().exists());
+        assert!(!inputs_dir(&data, "also-dead").unwrap().exists());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Like the sandboxes, an empty keep list is a failed load, not "delete all".
+    #[cfg(feature = "python-tool")]
+    #[tokio::test]
+    async fn sweep_with_nothing_to_keep_leaves_python_inputs_alone() {
+        use crate::python::inputs::inputs_dir;
+        let data = unique_data_folder();
+        let dir = inputs_dir(&data, "t1").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        sweep_thread_workspaces(&data, &[]).await.unwrap();
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[tokio::test]
+    async fn a_failing_removal_is_retried_after_each_pause() {
+        let pauses = [std::time::Duration::from_millis(1); 3];
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = retry_io(&pauses, || async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(std::io::Error::other("still in use"))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Out of pauses: the last error comes back, after pauses + 1 attempts.
+        calls.store(0, Ordering::SeqCst);
+        let result = retry_io(&pauses, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("still in use"))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
