@@ -89,6 +89,42 @@ describe('parsePythonOutput', () => {
     expect(parsed.files).toEqual([{ path: 'out.csv', size: 12 }])
   })
 
+  it('treats "terminated by signal" like an exit marker and keeps it as a note', async () => {
+    const { parsePythonOutput } = await import('../pythonTool')
+    expect(parsePythonOutput('x\n[terminated by signal]')).toEqual({
+      body: 'x',
+      exitCode: undefined,
+      files: [],
+      moreFiles: 0,
+      notes: ['[terminated by signal]'],
+    })
+    const timedOut =
+      '[timed out after 2 s: split the work or pass a larger timeout, up to 300]'
+    const stopped = '[stopped: the run used more than 2 GB of disk space]'
+    const parsed = parsePythonOutput(
+      ['[terminated by signal]', timedOut, stopped, '[file: a (1 bytes)]'].join(
+        '\n'
+      )
+    )
+    expect(parsed.body).toBe('')
+    expect(parsed.exitCode).toBeUndefined()
+    expect(parsed.notes).toEqual(['[terminated by signal]', timedOut, stopped])
+    expect(parsed.files).toEqual([{ path: 'a', size: 1 }])
+  })
+
+  it('anchors on "terminated by signal" so earlier look-alike lines stay in the body', async () => {
+    const { parsePythonOutput } = await import('../pythonTool')
+    const parsed = parsePythonOutput(
+      '[exit 3]\n[terminated by signal]\n[stopped: cancelled by the user]'
+    )
+    expect(parsed.body).toBe('[exit 3]')
+    expect(parsed.exitCode).toBeUndefined()
+    expect(parsed.notes).toEqual([
+      '[terminated by signal]',
+      '[stopped: cancelled by the user]',
+    ])
+  })
+
   it('reads a cancelled run', async () => {
     const { parsePythonOutput } = await import('../pythonTool')
     const parsed = parsePythonOutput(
@@ -168,6 +204,16 @@ describe('getPythonStatus', () => {
       available: false,
       reason: 'no sandbox',
     })
+  })
+
+  it('treats a synchronous throw from the plugin as unavailable', async () => {
+    pythonStatus.mockImplementation(() => {
+      throw new Error('sync boom')
+    })
+    const { getPythonStatus } = await import('../pythonTool')
+    const status = await getPythonStatus()
+    expect(status.available).toBe(false)
+    expect(status.reason).toContain('sync boom')
   })
 
   it('caches an unavailable answer when Tauri throws, and never throws', async () => {

@@ -3,6 +3,7 @@ import {
   pythonRun,
   pythonCancel,
   pythonSaveFile,
+  type PythonAttachment,
 } from '@janhq/tauri-plugin-agent-tools-api'
 import { getServiceHub } from '@/hooks/useServiceHub'
 
@@ -57,32 +58,27 @@ let statusCache: Promise<PythonAvailability> | null = null
  */
 export function getPythonStatus(): Promise<PythonAvailability> {
   if (!statusCache) {
-    statusCache = pythonStatus().then(
-      (status): PythonAvailability =>
-        status.available
-          ? { available: true }
-          : {
-              available: false,
-              ...(status.reason ? { reason: status.reason } : {}),
-            },
-      (error): PythonAvailability => ({
-        available: false,
-        reason: messageOf(error),
-      })
-    )
+    // `Promise.resolve().then` so a synchronous throw is caught here as well.
+    statusCache = Promise.resolve()
+      .then(() => pythonStatus())
+      .then(
+        (status): PythonAvailability =>
+          status.available
+            ? { available: true }
+            : {
+                available: false,
+                ...(status.reason ? { reason: status.reason } : {}),
+              },
+        (error): PythonAvailability => ({
+          available: false,
+          reason: messageOf(error),
+        })
+      )
   }
   return statusCache
 }
 
-/**
- * A file the user attached, to be copied into the run as a read-only input:
- * a file on disk (`path`) or text the app already holds (`content`).
- */
-export type PythonAttachment = {
-  name: string
-  path?: string
-  content?: string
-}
+export type { PythonAttachment }
 
 export type PythonResult = { content: string; isError: boolean }
 
@@ -171,7 +167,11 @@ const EXIT_MARKER = /^\[exit (-?\d+)\]$/
 // name itself contains spaces and parentheses.
 const FILE_MARKER = /^\[file: (.+) \((\d+) bytes\)\]$/
 const MORE_FILES_MARKER = /^\[files: (\d+) more not listed\]$/
+// Printed in place of `[exit N]` when the process was killed (after a timeout
+// or a stop), so it starts the marker run the same way.
+const TERMINATED_MARKER = /^\[terminated by signal\]$/
 const NOTE_MARKERS = [
+  TERMINATED_MARKER,
   /^\[timed out after .*\]$/,
   /^\[stopped: .*\]$/,
   /^\[input skipped: .*\]$/,
@@ -180,6 +180,7 @@ const NOTE_MARKERS = [
 
 const isMarker = (line: string): boolean =>
   EXIT_MARKER.test(line) ||
+  TERMINATED_MARKER.test(line) ||
   FILE_MARKER.test(line) ||
   MORE_FILES_MARKER.test(line) ||
   NOTE_MARKERS.some((re) => re.test(line))
@@ -198,7 +199,7 @@ export function parsePythonOutput(output: string): ParsedPythonOutput {
   // The real exit marker is the last one in the run; anything before it was
   // printed by the program.
   for (let i = lines.length - 1; i >= start; i--) {
-    if (EXIT_MARKER.test(lines[i])) {
+    if (EXIT_MARKER.test(lines[i]) || TERMINATED_MARKER.test(lines[i])) {
       start = i
       break
     }

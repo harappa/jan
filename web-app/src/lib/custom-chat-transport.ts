@@ -872,8 +872,9 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
   private onTokenUsage?: TokenUsageCallback
   private hasDocuments = false
   private modelSupportsTools = false
-  // Set by refreshTools when the sandboxed python tool is among the tools, so
-  // the system prompt (built synchronously) mentions it exactly when it is offered.
+  // Set together with `tools` by refreshTools when the sandboxed python tool is
+  // among them, so the system prompt (built synchronously) mentions it exactly
+  // when it is offered.
   private pythonOffered = false
   private ragFeatureAvailable = false
   protected systemMessage?: string
@@ -1027,13 +1028,14 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     // sync, so it reads the snapshot this await guarantees. Error-safe and
     // cached inside agentTools, so this is one IPC round-trip per store change.
     await refreshMemoryDigest()
-    this.pythonOffered = false
     if (!this.serviceHub) {
       this.tools = {}
+      this.pythonOffered = false
       return
     }
 
     const toolsRecord: Record<string, Tool> = {}
+    let pythonOffered = false
 
     // Tool availability is global (shared across all chats).
     const disabledToolKeys = useToolAvailable.getState().getDisabledTools()
@@ -1206,17 +1208,25 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
       // The sandboxed python tool. Its availability is asked once per app run
       // (cached), so the tool set and the prompt stay the same from turn to turn.
       if ((await getPythonStatus()).available) {
+        // Like the other built-in agent tools, it takes precedence over an MCP
+        // tool of the same name.
+        if (toolsRecord[PYTHON_TOOL_NAME]) {
+          console.warn(
+            `[tools] A tool named "${PYTHON_TOOL_NAME}" is already offered; the built-in sandboxed python tool replaces it.`
+          )
+        }
         toolsRecord[PYTHON_TOOL_NAME] = {
           description: PYTHON_TOOL_DESCRIPTION,
           inputSchema: jsonSchema(
             PYTHON_TOOL_INPUT_SCHEMA as unknown as Record<string, unknown>
           ),
         } as Tool
-        this.pythonOffered = true
+        pythonOffered = true
       }
     }
 
     this.tools = toolsRecord
+    this.pythonOffered = pythonOffered
   }
 
   private async resolveRouterModel(settings: {

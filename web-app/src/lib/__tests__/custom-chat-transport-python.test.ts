@@ -7,11 +7,12 @@ const h = vi.hoisted(() => ({
   serviceHub: null as unknown,
   python: { available: true } as { available: boolean; reason?: string },
   getPythonStatus: vi.fn(),
+  mcpTools: [] as Array<Record<string, unknown>>,
 }))
 
 h.serviceHub = {
   mcp: () => ({
-    getTools: vi.fn(async () => []),
+    getTools: vi.fn(async () => h.mcpTools),
   }),
   rag: () => ({ getTools: async () => [] }),
 }
@@ -101,6 +102,14 @@ vi.mock('@/lib/agentTools', () => ({
   memoryDigestNow: () => '',
   refreshMemoryDigest: vi.fn(async () => undefined),
   sandboxEnforces: () => false,
+  getMemoryCatalog: vi.fn(async () => []),
+}))
+vi.mock('@/lib/coworkEnv', () => ({
+  getCoworkEnvironment: vi.fn(async () => null),
+}))
+vi.mock('@/lib/coworkTools', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../coworkTools')>()),
+  buildCoworkTools: vi.fn(async () => ({ read: {} })),
 }))
 vi.mock('../pythonTool', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../pythonTool')>()),
@@ -108,6 +117,7 @@ vi.mock('../pythonTool', async (importOriginal) => ({
 }))
 
 import { CustomChatTransport } from '../custom-chat-transport'
+import { CoworkChatTransport } from '../coworkTransport'
 import {
   PYTHON_SYSTEM_SECTION,
   PYTHON_TOOL_DESCRIPTION,
@@ -143,6 +153,7 @@ describe('CustomChatTransport python tool', () => {
     h.python = { available: true }
     h.getPythonStatus.mockReset().mockImplementation(async () => h.python)
     selectedModel.capabilities = ['tools']
+    h.mcpTools = []
   })
 
   it('offers python with its description and system section when it is available', async () => {
@@ -215,5 +226,73 @@ describe('CustomChatTransport python tool', () => {
     expect(Object.keys(secondTools)).toEqual(Object.keys(firstTools))
     expect(secondTools.python.description).toBe(firstTools.python.description)
     expect(JSON.stringify(secondTools)).toBe(JSON.stringify(firstTools))
+  })
+
+  it('lets the built-in python tool replace an MCP tool of the same name, with a warning', async () => {
+    h.mcpTools = [
+      {
+        name: 'python',
+        description: 'an MCP python',
+        inputSchema: {},
+        server: 'srv',
+      },
+      { name: 'other', description: 'o', inputSchema: {}, server: 'srv' },
+    ]
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const transport = new CustomChatTransport('you are jan', 'thread-1')
+    await transport.refreshTools()
+
+    const tools = transport.getTools() as unknown as Record<
+      string,
+      { description: string }
+    >
+    expect(tools.python.description).toBe(PYTHON_TOOL_DESCRIPTION)
+    expect(Object.keys(tools)).toContain('other')
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('"python"'))).toBe(
+      true
+    )
+    warn.mockRestore()
+  })
+
+  it('keeps an MCP tool named python when the built-in one is not offered', async () => {
+    h.python = { available: false }
+    h.mcpTools = [
+      {
+        name: 'python',
+        description: 'an MCP python',
+        inputSchema: {},
+        server: 'srv',
+      },
+    ]
+    const transport = new CustomChatTransport('you are jan', 'thread-1')
+    await transport.refreshTools()
+    const tools = transport.getTools() as unknown as Record<
+      string,
+      { description: string }
+    >
+    expect(tools.python.description).toBe('an MCP python')
+    expect(transport.buildAgentToolsSystemInstruction()).not.toContain(
+      '# Python'
+    )
+  })
+
+  it('does not offer python, or its section, to a Cowork run', async () => {
+    const transport = new CoworkChatTransport('session-a', {
+      model: { provider: 'openai', id: 'gpt' },
+      workspacePath: null,
+      readOnlyFolder: null,
+      planMode: false,
+      webSearch: false,
+      allowSubagents: false,
+      subagentNames: [],
+    })
+    await drain(await send(transport, [user('u1', 'hello')]))
+
+    const call = streamTextCalls[0]
+    expect(Object.keys((call.tools as object) ?? {})).not.toContain('python')
+    expect(String(call.system)).not.toContain('# Python')
+    expect(transport.buildAgentToolsSystemInstruction()).not.toContain(
+      '# Python'
+    )
   })
 })
