@@ -383,8 +383,16 @@ fn run_blocking(
     });
 
     let folder = FolderWatch::start(spec.workspace.clone(), before_size);
-    let watch = watch(&process, deadline, &|| {
-        disk_stop(start_free, free_space(&spec.workspace), folder.growth())
+    // The folder's growth is checked on every poll (the walk thread refreshes
+    // it); the free space is read every `POLL_MS` and reused in between.
+    let mut now_free = start_free;
+    let mut free_read = Instant::now();
+    let watch = watch(&process, deadline, &mut || {
+        if free_read.elapsed() >= Duration::from_millis(POLL_MS) {
+            now_free = free_space(&spec.workspace);
+            free_read = Instant::now();
+        }
+        disk_stop(start_free, now_free, folder.growth())
     });
     drop(folder);
     let waited = if watch.error.is_some() {
@@ -487,8 +495,8 @@ fn spawn_reader(
 }
 
 /// Wait for the process to end, enforcing the deadline and stopping it when
-/// `disk` says so. `disk` is asked every `POLL_MS` and must be cheap (it reads
-/// the free space and the latest walk's result, never walks itself).
+/// `disk` says so. `disk` is asked on every poll and must be cheap (it reads
+/// the latest walk's result and a cached free space, never walks itself).
 ///
 /// MXC enforces `timeout_ms` only inside `wait` on Windows (its `try_wait`
 /// reports a timeout only after `kill_for_timeout`), while Bubblewrap's
@@ -497,10 +505,9 @@ fn spawn_reader(
 fn watch(
     process: &Mutex<MxcProcess>,
     deadline: Instant,
-    disk: &dyn Fn() -> Option<DiskStop>,
+    disk: &mut dyn FnMut() -> Option<DiskStop>,
 ) -> Watch {
     let mut watch = Watch::default();
-    let mut next_disk_check = Instant::now() + Duration::from_millis(POLL_MS);
     let mut killed_at: Option<Instant> = None;
     loop {
         let state = lock(process).try_wait();
@@ -531,17 +538,14 @@ fn watch(
             watch.timed_out = true;
             killed_at = Some(now);
             continue;
-        } else if now >= next_disk_check {
-            next_disk_check = now + Duration::from_millis(POLL_MS);
-            if let Some(stop) = disk() {
-                if let Err(e) = lock(process).kill() {
-                    watch.error = Some(format!("cannot stop the python process: {e}"));
-                    return watch;
-                }
-                watch.stopped = Some(stop.into());
-                killed_at = Some(now);
-                continue;
+        } else if let Some(stop) = disk() {
+            if let Err(e) = lock(process).kill() {
+                watch.error = Some(format!("cannot stop the python process: {e}"));
+                return watch;
             }
+            watch.stopped = Some(stop.into());
+            killed_at = Some(now);
+            continue;
         }
         std::thread::sleep(EXIT_POLL);
     }

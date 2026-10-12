@@ -15,9 +15,11 @@ pub const DISK_LIMIT_BYTES: u64 = 1 << 30;
 /// see: files deleted while still open, folders made unreadable, and Windows
 /// alternate data streams.
 pub const VOLUME_LIMIT_BYTES: u64 = 2 * DISK_LIMIT_BYTES;
-/// The shortest gap between two workspace walks, and how often the free space
-/// is read.
+/// How often the free space is read while a run is going.
 pub const POLL_MS: u64 = 500;
+/// The shortest gap between two workspace walks. Small: a script can put 2 GB
+/// into the page cache in well under a second.
+pub const WALK_FLOOR: Duration = Duration::from_millis(20);
 
 /// Why the disk watch wants a run stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,10 +50,10 @@ pub fn disk_stop(
 }
 
 /// The pause before the next workspace walk, given how long the last one took:
-/// at least `POLL_MS`, and twice the walk, so walking takes at most a third of
-/// one core however large the workspace is.
+/// at least `WALK_FLOOR`, and twice the walk, so walking takes at most a third
+/// of one core however large the workspace is.
 pub fn walk_gap(walk: Duration) -> Duration {
-    (walk * 2).max(Duration::from_millis(POLL_MS))
+    (walk * 2).max(WALK_FLOOR)
 }
 
 /// How many bytes the workspace has grown by since it held `before_size`.
@@ -234,11 +236,16 @@ mod tests {
     }
 
     #[test]
-    fn walks_are_at_least_half_a_second_and_twice_the_last_walk_apart() {
-        assert_eq!(walk_gap(Duration::ZERO), Duration::from_millis(500));
+    fn walks_are_at_least_20_ms_and_twice_the_last_walk_apart() {
+        assert_eq!(walk_gap(Duration::ZERO), WALK_FLOOR);
+        assert_eq!(WALK_FLOOR, Duration::from_millis(20));
         assert_eq!(
-            walk_gap(Duration::from_millis(249)),
-            Duration::from_millis(500)
+            walk_gap(Duration::from_millis(9)),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            walk_gap(Duration::from_millis(15)),
+            Duration::from_millis(30)
         );
         assert_eq!(
             walk_gap(Duration::from_millis(300)),
