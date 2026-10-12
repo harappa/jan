@@ -1158,6 +1158,8 @@ pub(crate) struct BashCapture {
     spill: Option<std::io::BufWriter<std::fs::File>>,
     spill_path: Option<PathBuf>,
     scratch: Option<PathBuf>,
+    /// False for [`BashCapture::without_spill`]: nothing is written to disk.
+    spill_enabled: bool,
 }
 
 impl BashCapture {
@@ -1169,7 +1171,20 @@ impl BashCapture {
             spill: None,
             spill_path: None,
             scratch,
+            spill_enabled: true,
         }
+    }
+
+    /// A capture that never writes a file: only the last [`BASH_MAX_BYTES`]
+    /// are kept, and a cut is reported as `[output truncated at B of T bytes]`
+    /// (no path, no hint to read the rest). It also reports bytes lost from the
+    /// front of a single long line, which the spilling mode does not.
+    // Only the python tool uses it; its unit tests run in every build.
+    #[cfg_attr(not(feature = "python-tool"), allow(dead_code))]
+    pub(crate) fn without_spill() -> Self {
+        let mut capture = Self::new(None);
+        capture.spill_enabled = false;
+        capture
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
@@ -1178,7 +1193,10 @@ impl BashCapture {
         // point `tail` still holds every byte seen so far (nothing dropped
         // yet), so dumping it captures the full prefix before we start
         // dropping from the front.
-        if self.spill.is_none() && self.tail.len() + chunk.len() > BASH_MAX_BYTES {
+        if self.spill_enabled
+            && self.spill.is_none()
+            && self.tail.len() + chunk.len() > BASH_MAX_BYTES
+        {
             if let Some(path) = new_temp_path(self.scratch.as_deref()) {
                 if let Ok(file) = open_spill_file(&path) {
                     let mut w = std::io::BufWriter::new(file);
@@ -1213,7 +1231,12 @@ impl BashCapture {
         // Truncated when the model-facing output lost real lines (front dropped)
         // or bytes (tail cap). CR-only progress redraws collapse to a single
         // line, so they read as complete rather than truncated.
-        let truncated = self.total_newlines > shown_lines || capped.len() < collapsed.len();
+        let mut truncated = self.total_newlines > shown_lines || capped.len() < collapsed.len();
+        // Without a spill file nothing else holds the dropped bytes, so any loss
+        // from the front counts, including part of one long line.
+        if !self.spill_enabled {
+            truncated |= self.total_bytes > self.tail.len();
+        }
 
         // Always emit an explicit exit marker on its own line. A bare exit code
         // (including 0) is the only reliable success signal: commands like
@@ -1237,7 +1260,8 @@ impl BashCapture {
 
         let path = match self.spill_path.take() {
             Some(p) => Some(p),
-            None => write_temp_output(&collapsed, self.scratch.as_deref()),
+            None if self.spill_enabled => write_temp_output(&collapsed, self.scratch.as_deref()),
+            None => None,
         }
         .map(|p| crate::tools::sandbox::scratch_display_path(self.scratch.as_deref(), &p));
         match path {
@@ -3980,5 +4004,61 @@ mod tests {
         // The base64 stays out of the model-facing text.
         assert!(!out.contains("base64"), "{out}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn capture_without_spill_cuts_many_lines_with_a_plain_note() {
+        let mut cap = BashCapture::without_spill();
+        for i in 0..3000 {
+            cap.push(format!("line {i}\n").as_bytes());
+        }
+        assert!(cap.spill.is_none() && cap.spill_path.is_none());
+        let out = cap.finish(Some(0));
+        let (body, note) = out.rsplit_once('\n').unwrap();
+        assert!(body.starts_with("line 1000\n"), "{body}");
+        assert!(body.ends_with("line 2999\n[exit 0]"), "{body}");
+        let total: usize = (0..3000).map(|i| format!("line {i}\n").len()).sum();
+        assert_eq!(
+            note,
+            format!("[output truncated at {} of {total} bytes]", body.len())
+        );
+    }
+
+    #[test]
+    fn capture_without_spill_notes_a_cut_single_line_and_stays_bounded() {
+        let mut cap = BashCapture::without_spill();
+        let chunk = vec![b'a'; 8192];
+        for _ in 0..40 {
+            cap.push(&chunk);
+            assert!(cap.tail.len() <= BASH_MAX_BYTES);
+        }
+        cap.push(b"END");
+        assert!(cap.spill.is_none() && cap.spill_path.is_none());
+        let out = cap.finish(Some(0));
+        let (body, note) = out.rsplit_once('\n').unwrap();
+        assert!(
+            body.ends_with("aaaEND\n[exit 0]"),
+            "{}",
+            &body[body.len() - 20..]
+        );
+        assert_eq!(body.len(), BASH_MAX_BYTES + "\n[exit 0]".len());
+        assert_eq!(
+            note,
+            format!(
+                "[output truncated at {} of {} bytes]",
+                body.len(),
+                40 * 8192 + 3
+            )
+        );
+    }
+
+    #[test]
+    fn capture_without_spill_leaves_short_output_alone() {
+        let mut cap = BashCapture::without_spill();
+        cap.push(b"hello\n");
+        assert_eq!(cap.finish(Some(0)), "hello\n[exit 0]");
+        let mut cap = BashCapture::without_spill();
+        cap.push(&vec![b'x'; BASH_MAX_BYTES]);
+        assert!(!cap.finish(Some(0)).contains("[output truncated"));
     }
 }
