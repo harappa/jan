@@ -7,6 +7,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// The bundled runtime's version: CPython version plus the python-build-standalone
 /// release tag. `scripts/download-python.mjs` writes the same string to `jan-runtime-id`.
@@ -35,37 +37,104 @@ pub fn python_executable(runtime: &Path) -> PathBuf {
 /// Make sure the runtime is in the data folder and return its folder.
 ///
 /// `bundled` is the app's `resources/python`. A folder already marked complete is
-/// returned as is. Otherwise the bundled tree is copied to `<RUNTIME_ID>.partial`
-/// (a leftover one is discarded first), marked, and renamed into place, so an
+/// returned as is. Otherwise the bundled tree is copied to a private
+/// `<RUNTIME_ID>.partial-<pid>-<n>` folder, marked, and renamed into place, so an
 /// interrupted copy (disk full, app killed) is never used and is redone next time.
+///
+/// Calls in one process are serialized, and each copy has its own partial folder,
+/// so concurrent first runs (two chats, or two Jan instances) never share or
+/// delete each other's files.
 ///
 /// Synchronous file I/O: call it from a blocking task.
 pub fn ensure_runtime(bundled: &Path, data_folder: &Path) -> Result<PathBuf, String> {
+    ensure_runtime_with(bundled, data_folder, &|| {})
+}
+
+/// `ensure_runtime`, calling `before_rename` just before the finished copy is
+/// moved into place (a seam for tests to play another process finishing first).
+fn ensure_runtime_with(
+    bundled: &Path,
+    data_folder: &Path,
+    before_rename: &dyn Fn(),
+) -> Result<PathBuf, String> {
     let target = runtime_dir(data_folder);
+    if target.join(COMPLETE_MARKER).is_file() {
+        return Ok(target);
+    }
+    // A poisoned lock only means another copy panicked; its partial folder is
+    // private and gets cleaned up below.
+    let _guard = COPY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Another thread may have finished while this one waited.
     if target.join(COMPLETE_MARKER).is_file() {
         return Ok(target);
     }
     check_bundled(bundled)?;
 
-    let partial = partial_dir(&target);
-    // A folder without the marker is a broken earlier copy: start over.
-    remove_dir_if_exists(&partial)?;
-    remove_dir_if_exists(&target)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|e| io_error("create", parent, &e))?;
     }
-    copy_tree(bundled, &partial)?;
+    // Leftovers of earlier runs that were killed mid-copy.
+    remove_partials(&target)?;
+    // A folder without the marker is a broken earlier copy: start over.
+    remove_dir_if_exists(&target)?;
+
+    let partial = unique_partial_dir(&target);
+    let result = copy_and_publish(bundled, &partial, &target, before_rename);
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&partial);
+    }
+    result
+}
+
+fn copy_and_publish(
+    bundled: &Path,
+    partial: &Path,
+    target: &Path,
+    before_rename: &dyn Fn(),
+) -> Result<PathBuf, String> {
+    copy_tree(bundled, partial)?;
     let marker = partial.join(COMPLETE_MARKER);
     fs::write(&marker, RUNTIME_ID).map_err(|e| io_error("write", &marker, &e))?;
-    if let Err(e) = fs::rename(&partial, &target) {
+    before_rename();
+    if let Err(e) = fs::rename(partial, target) {
         // Another process may have finished the same copy first.
         if target.join(COMPLETE_MARKER).is_file() {
-            let _ = fs::remove_dir_all(&partial);
-            return Ok(target);
+            let _ = fs::remove_dir_all(partial);
+            return Ok(target.to_path_buf());
         }
-        return Err(io_error("rename", &partial, &e));
+        return Err(io_error("rename", partial, &e));
     }
-    Ok(target)
+    Ok(target.to_path_buf())
+}
+
+/// Serializes the copy section within this process.
+static COPY_LOCK: Mutex<()> = Mutex::new(());
+
+/// Distinguishes the partial folders of calls within one process.
+static PARTIAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A partial folder no other call or process uses.
+fn unique_partial_dir(target: &Path) -> PathBuf {
+    let n = PARTIAL_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let mut name = partial_dir(target).into_os_string();
+    name.push(format!("-{}-{n}", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// Remove every `<RUNTIME_ID>.partial*` folder next to `target`.
+fn remove_partials(target: &Path) -> Result<(), String> {
+    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        return Ok(());
+    };
+    let prefix = format!("{}.partial", name.to_string_lossy());
+    let entries = fs::read_dir(parent).map_err(|e| io_error("read", parent, &e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error("read", parent, &e))?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            remove_dir_if_exists(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// The bundled folder must hold this build's runtime. In builds where it was not
@@ -200,6 +269,23 @@ mod tests {
         bundled
     }
 
+    /// Every file under `root`, relative to it.
+    fn files_under(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path.strip_prefix(root).unwrap().to_path_buf());
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn runtime_dir_is_versioned_under_the_data_folder() {
         let dir = runtime_dir(Path::new("data"));
@@ -300,6 +386,95 @@ mod tests {
         assert!(dir.join(COMPLETE_MARKER).is_file());
         assert!(dir.join("python/Lib/os.py").is_file());
         assert!(!dir.join("python/stale.bin").exists());
+    }
+
+    #[test]
+    fn leftover_partials_of_any_name_are_removed() {
+        let bundled = fake_bundled(RUNTIME_ID);
+        let data = Scratch::new();
+        let target = runtime_dir(data.path());
+        let parent = target.parent().unwrap();
+        let old = parent.join(format!("{RUNTIME_ID}.partial-99999-0"));
+        fs::create_dir_all(old.join("python")).unwrap();
+        fs::write(old.join("python/half.bin"), "junk").unwrap();
+        let other = parent.join("unrelated");
+        fs::create_dir_all(&other).unwrap();
+
+        ensure_runtime(bundled.path(), data.path()).unwrap();
+        assert!(!old.exists());
+        assert!(other.exists());
+        assert!(target.join(COMPLETE_MARKER).is_file());
+    }
+
+    #[test]
+    fn concurrent_first_calls_all_get_a_whole_runtime() {
+        let bundled = fake_bundled(RUNTIME_ID);
+        // Enough files that the copies overlap in time.
+        for i in 0..300 {
+            bundled.write(&format!("python/Lib/mod{}/file{i}.py", i % 20), "# x");
+        }
+        let data = Scratch::new();
+        let results: Vec<Result<PathBuf, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..6)
+                .map(|_| scope.spawn(|| ensure_runtime(bundled.path(), data.path())))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let expected = runtime_dir(data.path());
+        for result in &results {
+            assert_eq!(result.as_ref().unwrap(), &expected);
+        }
+        assert!(expected.join(COMPLETE_MARKER).is_file());
+        for rel in files_under(bundled.path()) {
+            assert!(expected.join(&rel).is_file(), "missing {}", rel.display());
+        }
+        let leftovers: Vec<_> = fs::read_dir(expected.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_target_completed_by_someone_else_before_the_rename_is_used() {
+        let bundled = fake_bundled(RUNTIME_ID);
+        let data = Scratch::new();
+        let target = runtime_dir(data.path());
+        let finish_elsewhere = || {
+            fs::create_dir_all(target.join("python")).unwrap();
+            fs::write(target.join("python/from-other.txt"), "other").unwrap();
+            fs::write(target.join(COMPLETE_MARKER), RUNTIME_ID).unwrap();
+        };
+        let dir = ensure_runtime_with(bundled.path(), data.path(), &finish_elsewhere).unwrap();
+        assert_eq!(dir, target);
+        // The other copy is kept untouched and our own partial is gone.
+        assert!(target.join("python/from-other.txt").is_file());
+        assert!(!target.join("python/Lib/os.py").exists());
+        let names: Vec<_> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    #[test]
+    fn a_rename_that_fails_without_a_complete_target_is_an_error() {
+        let bundled = fake_bundled(RUNTIME_ID);
+        let data = Scratch::new();
+        let target = runtime_dir(data.path());
+        // A non-empty target without the marker blocks the rename.
+        let block = || {
+            fs::create_dir_all(target.join("python")).unwrap();
+            fs::write(target.join("python/junk.bin"), "junk").unwrap();
+        };
+        assert!(ensure_runtime_with(bundled.path(), data.path(), &block).is_err());
+        assert!(!target.join(COMPLETE_MARKER).exists());
+        // Our partial is cleaned up on failure.
+        let names: Vec<_> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
     }
 
     #[test]
