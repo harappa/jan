@@ -320,6 +320,20 @@ vi.mock('@/lib/completion', () => ({
   }),
 }))
 
+const py = vi.hoisted(() => ({
+  executePython: vi.fn(),
+  collectPythonAttachments: vi.fn(),
+}))
+
+vi.mock('@/lib/pythonTool', () => ({
+  PYTHON_TOOL_NAME: 'python',
+  executePython: py.executePython,
+}))
+
+vi.mock('@/lib/pythonAttachments', () => ({
+  collectPythonAttachments: py.collectPythonAttachments,
+}))
+
 vi.mock('@/lib/attachmentProcessing', () => ({
   processAttachmentsForSend: vi
     .fn()
@@ -474,6 +488,13 @@ describe('ThreadDetail route', () => {
     h.appStateState.tools = []
     h.toolApprovalState.requestApproval = vi.fn().mockResolvedValue(true)
     hub.mcp = realMcp
+    py.executePython.mockReset()
+    py.executePython.mockResolvedValue({
+      content: 'ok\n[exit 0]',
+      isError: false,
+    })
+    py.collectPythonAttachments.mockReset()
+    py.collectPythonAttachments.mockResolvedValue([])
     useToolCallRuntime.getState().reset()
     sessionStorage.clear()
   })
@@ -1163,6 +1184,130 @@ describe('ThreadDetail route', () => {
         expect(runtime.queue).toEqual([])
         expect(runtime.timings['tcA']?.startedAt).toBeUndefined()
         expect(runtime.timings['tcA']?.endedAt).toBeDefined()
+      })
+    })
+
+    describe('python tool', () => {
+      const pythonCall = (id: string, input: unknown) => ({
+        toolCall: { toolCallId: id, toolName: 'python', input },
+      })
+      const run = async (id: string, input: unknown) => {
+        renderComponent()
+        await act(async () => {
+          await (h as any).capturedOnToolCall(pythonCall(id, input))
+        })
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+      }
+
+      it('runs without asking for approval', async () => {
+        await run('py1', { code: 'print(1)' })
+
+        expect(h.toolApprovalState.requestApproval).not.toHaveBeenCalled()
+        expect(py.executePython).toHaveBeenCalledTimes(1)
+      })
+
+      it('runs the code with the thread id and the timeout', async () => {
+        await run('py2', { code: 'print(1)', timeout: 60 })
+
+        expect(py.executePython).toHaveBeenCalledWith(
+          'thread-1',
+          { code: 'print(1)', timeout: 60 },
+          []
+        )
+      })
+
+      it('passes the attachments collected from the chat messages', async () => {
+        const attachments = [{ name: 'a.pdf', path: '/data/a.pdf' }]
+        py.collectPythonAttachments.mockResolvedValue(attachments)
+        h.chatState.messages = [
+          { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] },
+        ]
+
+        await run('py3', { code: 'print(1)' })
+
+        expect(py.collectPythonAttachments).toHaveBeenCalledWith(
+          'thread-1',
+          h.chatState.messages
+        )
+        expect(py.executePython.mock.calls[0][2]).toBe(attachments)
+      })
+
+      it('gives the result to the model as the tool output', async () => {
+        py.executePython.mockResolvedValue({
+          content: '42\n[exit 0]',
+          isError: false,
+        })
+
+        await run('py4', { code: 'print(42)' })
+
+        expect(h.mockAddToolOutput).toHaveBeenCalledWith({
+          tool: 'python',
+          toolCallId: 'py4',
+          output: '42\n[exit 0]',
+        })
+      })
+
+      // The model has to read the traceback to fix its code, so a failed run
+      // is an output, not an errorText.
+      it('gives a failed run to the model as output too', async () => {
+        py.executePython.mockResolvedValue({
+          content: 'Traceback\nNameError: x\n[exit 1]',
+          isError: true,
+        })
+
+        await run('py5', { code: 'x' })
+
+        expect(h.mockAddToolOutput).toHaveBeenCalledTimes(1)
+        const call = h.mockAddToolOutput.mock.calls[0][0]
+        expect(call).toEqual({
+          tool: 'python',
+          toolCallId: 'py5',
+          output: 'Traceback\nNameError: x\n[exit 1]',
+        })
+        expect(call).not.toHaveProperty('errorText')
+        expect(call).not.toHaveProperty('state')
+      })
+
+      it.each([
+        ['missing', {}],
+        ['not a string', { code: 5 }],
+        ['no input', undefined],
+      ])('answers ERROR without running: code is %s', async (_n, input) => {
+        await run('py6', input)
+
+        expect(py.executePython).not.toHaveBeenCalled()
+        expect(h.mockAddToolOutput).toHaveBeenCalledTimes(1)
+        const call = h.mockAddToolOutput.mock.calls[0][0]
+        expect(call.toolCallId).toBe('py6')
+        expect(call.output).toMatch(/^ERROR: /)
+        expect(call).not.toHaveProperty('errorText')
+      })
+
+      it('answers an ERROR output when running throws', async () => {
+        py.executePython.mockRejectedValue(new Error('boom'))
+
+        await run('py7', { code: 'print(1)' })
+
+        expect(h.mockAddToolOutput).toHaveBeenCalledWith({
+          tool: 'python',
+          toolCallId: 'py7',
+          output: 'ERROR: boom',
+        })
+      })
+
+      it('answers an ERROR output when the attachments cannot be collected', async () => {
+        py.collectPythonAttachments.mockRejectedValue(new Error('no list'))
+
+        await run('py8', { code: 'print(1)' })
+
+        expect(py.executePython).not.toHaveBeenCalled()
+        expect(h.mockAddToolOutput).toHaveBeenCalledWith({
+          tool: 'python',
+          toolCallId: 'py8',
+          output: 'ERROR: no list',
+        })
       })
     })
 

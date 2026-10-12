@@ -309,6 +309,11 @@ vi.mock('@/components/ui/tooltip', () => {
   }
 })
 
+const cancelPythonMock = vi.hoisted(() => vi.fn().mockResolvedValue(false))
+vi.mock('@/lib/pythonTool', () => ({
+  cancelPython: cancelPythonMock,
+}))
+
 vi.mock('@/lib/platform/utils', () => ({
   isPlatformTauri: () => false,
 }))
@@ -466,6 +471,38 @@ describe('ChatInput', () => {
     // Accept either onStop called OR clearQueue called (both are valid stop-click paths).
     const clicked = onStop.mock.calls.length + clearQueueMock.mock.calls.length
     expect(clicked).toBeGreaterThanOrEqual(0) // smoke: no crash
+  })
+
+  describe('stopping a python run', () => {
+    const clickStop = () =>
+      fireEvent.click(screen.getByTestId('stop-message-button'))
+
+    beforeEach(() => {
+      cancelPythonMock.mockReset()
+      cancelPythonMock.mockResolvedValue(true)
+    })
+
+    it('cancels the chat python run when Stop is clicked', () => {
+      const onStop = vi.fn()
+      renderInput({ chatStatus: 'streaming', onStop })
+
+      clickStop()
+
+      expect(onStop).toHaveBeenCalledTimes(1)
+      expect(cancelPythonMock).toHaveBeenCalledWith('thread-1')
+    })
+
+    it('does not cancel anything when Stop only clears the queue', () => {
+      queueState['thread-1'] = [{ id: 'q1', text: 'later' }]
+      const onStop = vi.fn()
+      renderInput({ chatStatus: 'streaming', onStop })
+
+      clickStop()
+
+      expect(clearQueueMock).toHaveBeenCalled()
+      expect(onStop).not.toHaveBeenCalled()
+      expect(cancelPythonMock).not.toHaveBeenCalled()
+    })
   })
 
   it('queues the message when streaming with a currentThreadId', async () => {

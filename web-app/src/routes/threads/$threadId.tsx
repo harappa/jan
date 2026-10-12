@@ -91,6 +91,8 @@ import { useToolApprovalRequests } from '@/hooks/useToolApprovalRequests'
 import { useToolCallRuntime } from '@/hooks/useToolCallRuntime'
 import { WEB_TOOL_NAMES, executeWebTool } from '@/lib/webSearchTool'
 import { CHAT_AGENT_TOOL_NAMES, executeAgentTool } from '@/lib/agentTools'
+import { PYTHON_TOOL_NAME, executePython } from '@/lib/pythonTool'
+import { collectPythonAttachments } from '@/lib/pythonAttachments'
 import DropdownModelProvider from '@/containers/DropdownModelProvider'
 import { ExtensionTypeEnum, VectorDBExtension } from '@janhq/core'
 import { ExtensionManager } from '@/lib/extension'
@@ -119,13 +121,44 @@ function serverForTool(toolName: string): string | undefined {
 
 // Internal tools never prompt: RAG and the native web tools are Jan's own, and
 // the built-in shell is gated in Rust (execute_tool refuses anything needing
-// approval), so only workspace-confined calls ever reach here.
+// approval), so only workspace-confined calls ever reach here. The python tool
+// runs in a sandbox with no network, no access outside its own workspace and
+// read-only copies of the chat's attachments.
 function isAutoAllowedTool(toolName: string): boolean {
   return (
     useAppState.getState().ragToolNames.has(toolName) ||
     WEB_TOOL_NAMES.has(toolName) ||
-    CHAT_AGENT_TOOL_NAMES.has(toolName)
+    CHAT_AGENT_TOOL_NAMES.has(toolName) ||
+    toolName === PYTHON_TOOL_NAME
   )
+}
+
+// Runs the model's python call. The text goes back to the model whatever the
+// outcome: a traceback is how it learns to fix its code, so even a failed run
+// is an output, never an errorText.
+async function runPythonToolCall(
+  threadId: string,
+  input: unknown,
+  messages: UIMessage[]
+): Promise<string> {
+  const { code, timeout } = (input ?? {}) as {
+    code?: unknown
+    timeout?: unknown
+  }
+  if (typeof code !== 'string') {
+    return 'ERROR: the python tool needs a "code" string with the Python code to run.'
+  }
+  try {
+    const attachments = await collectPythonAttachments(threadId, messages)
+    const { content } = await executePython(
+      threadId,
+      { code, ...(typeof timeout === 'number' ? { timeout } : {}) },
+      attachments
+    )
+    return content
+  } catch (error) {
+    return `ERROR: ${error instanceof Error ? error.message : String(error)}`
+  }
 }
 
 // Persist the out-of-context error onto the latest user message so the banner
@@ -571,6 +604,14 @@ function ThreadDetail() {
 
             if (WEB_TOOL_NAMES.has(toolName)) {
               result = await executeWebTool(toolName, toolCall.input)
+            } else if (toolName === PYTHON_TOOL_NAME) {
+              result = {
+                content: await runPythonToolCall(
+                  threadId,
+                  toolCall.input,
+                  chatMessagesRef.current
+                ),
+              }
             } else if (CHAT_AGENT_TOOL_NAMES.has(toolName)) {
               // Chat's shell runs with the sandbox network closed: the default
               // `allowNetwork = false` is the contract here, not an accident.

@@ -67,6 +67,7 @@ import {
 } from '@/constants/chat'
 import { defaultModel } from '@/lib/models'
 import { cancelAgentThreadBash } from '@/lib/agentTools'
+import { cancelPython } from '@/lib/pythonTool'
 import { useAssistant } from '@/hooks/useAssistant'
 import { AssistantSwitcher } from '@/containers/AssistantSwitcher'
 import DropdownToolsAvailable from '@/containers/DropdownToolsAvailable'
@@ -880,6 +881,9 @@ const ChatInput = memo(function ChatInput({
       // or backgrounded shell keeps executing until its session's shells are
       // killed. Chat's tool thread_id is the chat thread id.
       void cancelAgentThreadBash(threadId)
+      // Likewise a python run: the sandboxed process is killed here, not by the
+      // abort above. It never rejects (a failure is logged inside).
+      void cancelPython(threadId)
     },
     [abortControllers, cancelToolCall, onStop]
   )
