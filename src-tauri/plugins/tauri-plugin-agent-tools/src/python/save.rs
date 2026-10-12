@@ -145,7 +145,12 @@ fn handle_path(file: &File) -> io::Result<PathBuf> {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
 fn handle_path(_file: &File) -> io::Result<PathBuf> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
