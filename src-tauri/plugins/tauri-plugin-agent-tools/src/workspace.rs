@@ -935,16 +935,16 @@ mod tests {
     async fn removing_a_thread_also_removes_its_python_inputs() {
         use crate::python::inputs::inputs_dir;
         let data = unique_data_folder();
-        ensure_thread_workspace(&data, "t1").await.unwrap();
-        let mine = inputs_dir(&data, "t1").unwrap();
-        let theirs = inputs_dir(&data, "t2").unwrap();
+        ensure_thread_workspace(&data, "py-t1").await.unwrap();
+        let mine = inputs_dir(&data, "py-t1").unwrap();
+        let theirs = inputs_dir(&data, "py-t2").unwrap();
         for dir in [&mine, &theirs] {
             std::fs::create_dir_all(dir).unwrap();
             std::fs::write(dir.join("data.csv"), "a,b").unwrap();
         }
 
-        remove_thread_workspace(&data, "t1").await.unwrap();
-        assert!(!thread_workspace(&data, "t1").unwrap().exists());
+        remove_thread_workspace(&data, "py-t1").await.unwrap();
+        assert!(!thread_workspace(&data, "py-t1").unwrap().exists());
         assert!(!mine.exists(), "the thread's inputs must go with it");
         assert!(
             theirs.join("data.csv").is_file(),
@@ -960,11 +960,11 @@ mod tests {
     async fn removing_python_inputs_does_not_need_the_workspace_or_the_inputs() {
         use crate::python::inputs::inputs_dir;
         let data = unique_data_folder();
-        let inputs = inputs_dir(&data, "t1").unwrap();
+        let inputs = inputs_dir(&data, "py-t1").unwrap();
         std::fs::create_dir_all(&inputs).unwrap();
-        remove_thread_workspace(&data, "t1").await.unwrap();
+        remove_thread_workspace(&data, "py-t1").await.unwrap();
         assert!(!inputs.exists());
-        remove_thread_workspace(&data, "t1").await.unwrap();
+        remove_thread_workspace(&data, "py-t1").await.unwrap();
         let _ = std::fs::remove_dir_all(&data);
     }
 
@@ -976,14 +976,14 @@ mod tests {
         use crate::python::inputs::inputs_dir;
         let data = unique_data_folder();
         // A file where the sandbox folder should be: removing it as a folder fails.
-        let sandbox = thread_workspace(&data, "t1").unwrap();
+        let sandbox = thread_workspace(&data, "py-t1").unwrap();
         std::fs::create_dir_all(sandbox.parent().unwrap()).unwrap();
         std::fs::write(&sandbox, "not a folder").unwrap();
-        let inputs = inputs_dir(&data, "t1").unwrap();
+        let inputs = inputs_dir(&data, "py-t1").unwrap();
         std::fs::create_dir_all(&inputs).unwrap();
         std::fs::write(inputs.join("data.csv"), "a,b").unwrap();
 
-        let result = remove_thread_workspace_with(&data, "t1", &[]).await;
+        let result = remove_thread_workspace_with(&data, "py-t1", &[]).await;
         assert!(result.is_err(), "the sandbox failure must be reported");
         assert!(result.unwrap_err().starts_with("ERROR: "));
         assert!(!inputs.exists(), "the inputs must be removed regardless");
@@ -1023,7 +1023,7 @@ mod tests {
     async fn sweep_with_nothing_to_keep_leaves_python_inputs_alone() {
         use crate::python::inputs::inputs_dir;
         let data = unique_data_folder();
-        let dir = inputs_dir(&data, "t1").unwrap();
+        let dir = inputs_dir(&data, "py-t1").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         sweep_thread_workspaces(&data, &[]).await.unwrap();
         assert!(dir.is_dir());
