@@ -123,9 +123,10 @@ function serverForTool(toolName: string): string | undefined {
     ?.server
 }
 
-// Internal tools never prompt: RAG and the native web tools are Jan's own, and
-// the built-in shell is gated in Rust (execute_tool refuses anything needing
-// approval), so only workspace-confined calls ever reach here.
+// Internal tools never prompt: RAG and the native web tools are Jan's own. Chat
+// offers no built-in agent tool (CHAT_AGENT_TOOL_NAMES is empty; the python tool
+// is handled apart, see isBuiltInPython), so a call named shell or read can only
+// be an MCP server's tool and takes the ordinary approval and route.
 function isAutoAllowedTool(toolName: string): boolean {
   return (
     useAppState.getState().ragToolNames.has(toolName) ||
@@ -625,8 +626,10 @@ function ThreadDetail() {
                 ),
               }
             } else if (CHAT_AGENT_TOOL_NAMES.has(toolName)) {
-              // Chat's shell runs with the sandbox network closed: the default
-              // `allowNetwork = false` is the contract here, not an accident.
+              // Reached only if a name is ever added to the chat subset (it is
+              // empty now). Chat's built-ins run with the sandbox network
+              // closed: the default `allowNetwork = false` is the contract
+              // here, not an accident.
               const agentResult = await executeAgentTool(
                 toolName,
                 toolCall.input,

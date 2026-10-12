@@ -95,9 +95,9 @@ vi.mock('@/lib/reasoningProviderOptions', () => ({
 vi.mock('../model-factory', () => ({
   ModelFactory: { createModel: vi.fn(async () => ({ modelId: 'gpt' })) },
 }))
-// The sandboxed shell is out of this test: no shell schema, no shell section.
+// The agent tools are out of this test: no schema, no memory digest.
 vi.mock('@/lib/agentTools', () => ({
-  CHAT_AGENT_TOOL_NAMES: new Set(['shell']),
+  CHAT_AGENT_TOOL_NAMES: new Set<string>(),
   getAgentToolSchemas: vi.fn(async () => []),
   memoryDigestNow: () => '',
   refreshMemoryDigest: vi.fn(async () => undefined),

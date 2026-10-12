@@ -147,4 +147,24 @@ describe('ToolCallCard', () => {
       screen.getByText('tools:toolCall.used:task: researcher')
     ).toBeInTheDocument()
   })
+
+  // Chat no longer offers the shell, but threads saved before that still hold
+  // its calls; they must keep rendering as a terminal.
+  it('still shows the terminal card of a shell call saved in an old thread', () => {
+    origin.mockReturnValue({ kind: 'agent' })
+    render(
+      <ToolCallCard
+        part={{
+          type: 'tool-shell',
+          state: 'output-available',
+          toolCallId: 'tc-old',
+          input: { command: 'echo saved-command' },
+          output: 'saved-output\n[exit 0]',
+        }}
+        messageId="m1"
+      />
+    )
+    expect(screen.getByText('saved-output')).toBeInTheDocument()
+    expect(screen.getByText(/echo saved-command/)).toBeInTheDocument()
+  })
 })

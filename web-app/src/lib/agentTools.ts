@@ -65,11 +65,13 @@ export const isRecordedShellCall = (toolName: string): boolean =>
   toolName === 'shell' || toolName === 'bash'
 
 /**
- * The subset the main chat surface advertises and dispatches: the sandboxed
- * shell alone, with no network. The full toolset above is Cowork's — chat is a
- * conversation that occasionally runs a command, not an agent surface.
+ * The subset the main chat surface advertises and dispatches: none. The whole
+ * toolset above is Cowork's. Chat runs code through the sandboxed python tool
+ * (see `pythonTool.ts`) and never offers the shell, so a model there cannot
+ * start a process on the user's machine. The set stays so that the chat code
+ * paths that consult it keep one place to say what the built-ins are.
  */
-export const CHAT_AGENT_TOOL_NAMES = new Set(['shell'])
+export const CHAT_AGENT_TOOL_NAMES = new Set<string>()
 
 /**
  * Tools that only run under an enforcing OS sandbox. They stay in

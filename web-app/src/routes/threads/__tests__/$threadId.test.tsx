@@ -337,6 +337,13 @@ vi.mock('@/lib/pythonAttachments', () => ({
   collectPythonAttachments: py.collectPythonAttachments,
 }))
 
+const agent = vi.hoisted(() => ({ executeAgentTool: vi.fn() }))
+
+vi.mock('@/lib/agentTools', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/agentTools')>()),
+  executeAgentTool: agent.executeAgentTool,
+}))
+
 vi.mock('@/lib/attachmentProcessing', () => ({
   processAttachmentsForSend: vi
     .fn()
@@ -1190,6 +1197,69 @@ describe('ThreadDetail route', () => {
         expect(runtime.queue).toEqual([])
         expect(runtime.timings['tcA']?.startedAt).toBeUndefined()
         expect(runtime.timings['tcA']?.endedAt).toBeDefined()
+      })
+    })
+
+    // Chat no longer offers the built-in shell, so a call named shell can only
+    // be an MCP server's tool: it must ask for approval and go to that server,
+    // never to the sandboxed built-in (the same rule as python above).
+    describe('a tool named shell', () => {
+      const shellCall = (id: string, input: unknown) => ({
+        toolCall: { toolCallId: id, toolName: 'shell', input },
+      })
+      const run = async (id: string, input: unknown) => {
+        renderComponent()
+        await act(async () => {
+          await (h as any).capturedOnToolCall(shellCall(id, input))
+        })
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+      }
+
+      beforeEach(() => {
+        agent.executeAgentTool.mockReset().mockResolvedValue({ content: [] })
+        h.appStateState.mcpToolNames = new Set(['shell'])
+      })
+
+      it('asks for approval like any other tool', async () => {
+        await run('sh1', { command: 'echo 1' })
+
+        expect(h.toolApprovalState.requestApproval).toHaveBeenCalledWith(
+          'sh1',
+          'shell',
+          'thread-1',
+          undefined
+        )
+      })
+
+      it('routes the call to the MCP tool, not the built-in shell', async () => {
+        const callTool = vi.fn().mockResolvedValue({ error: '', content: [] })
+        hub.mcp = () => ({ callTool }) as never
+
+        await run('sh2', { command: 'echo 1' })
+
+        expect(callTool).toHaveBeenCalledWith(
+          expect.objectContaining({
+            toolName: 'shell',
+            arguments: { command: 'echo 1' },
+          })
+        )
+        expect(agent.executeAgentTool).not.toHaveBeenCalled()
+      })
+
+      it('does not run it when the approval is denied', async () => {
+        h.toolApprovalState.requestApproval = vi.fn().mockResolvedValue(false)
+        const callTool = vi.fn().mockResolvedValue({ error: '', content: [] })
+        hub.mcp = () => ({ callTool }) as never
+
+        await run('sh3', { command: 'echo 1' })
+
+        expect(callTool).not.toHaveBeenCalled()
+        expect(agent.executeAgentTool).not.toHaveBeenCalled()
+        expect(h.mockAddToolOutput).toHaveBeenCalledWith(
+          expect.objectContaining({ toolCallId: 'sh3', state: 'output-error' })
+        )
       })
     })
 

@@ -34,13 +34,7 @@ import {
   WEB_FETCH_DESCRIPTION,
   WEB_FETCH_INPUT_SCHEMA,
 } from '@/lib/webSearchTool'
-import {
-  CHAT_AGENT_TOOL_NAMES,
-  getAgentToolSchemas,
-  memoryDigestNow,
-  refreshMemoryDigest,
-  sandboxEnforces,
-} from '@/lib/agentTools'
+import { memoryDigestNow, refreshMemoryDigest } from '@/lib/agentTools'
 import {
   PYTHON_SYSTEM_SECTION,
   PYTHON_TOOL_DESCRIPTION,
@@ -1189,21 +1183,8 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
         } as Tool
       }
 
-      // The main chat offers exactly one built-in agent tool: the sandboxed
-      // shell, with no network. The full toolset lives in Cowork. Schemas come
-      // from Rust so they are never re-typed here, and `getAgentToolSchemas`
-      // already withholds shell when no sandbox backend can confine it.
-      try {
-        for (const schema of await getAgentToolSchemas()) {
-          if (!CHAT_AGENT_TOOL_NAMES.has(schema.function.name)) continue
-          toolsRecord[schema.function.name] = {
-            description: schema.function.description,
-            inputSchema: jsonSchema(schema.function.parameters),
-          } as Tool
-        }
-      } catch (error) {
-        console.warn('Failed to load agent tools:', error)
-      }
+      // The main chat offers no shell and no other workspace agent tool: those
+      // are Cowork's. A tool with one of their names is an MCP server's own.
 
       // The sandboxed python tool. Its availability is asked once per app run
       // (cached), so the tool set and the prompt stay the same from turn to turn.
@@ -1844,12 +1825,6 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
   }
 
   /**
-   * Static instruction for the one built-in tool chat offers: the sandboxed
-   * shell. Empty when no sandbox backend enforces, because shell is then
-   * withheld too — stating limits for a tool that is not offered would only
-   * confuse the model, and an empty string keeps the prompt prefix stable.
-   */
-  /**
    * A self-contained digest of the newest memory notes. Chat advertises no
    * memory tools, so a catalog it cannot dereference would be useless; whole
    * notes under a strict budget are what fit a conversation surface. Empty when
@@ -1867,25 +1842,14 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     ].join('\n')
   }
 
+  /**
+   * Static instruction for the one built-in tool chat offers: the sandboxed
+   * python. Empty when it is not offered, because stating limits for a tool
+   * that is absent would only confuse the model, and an empty string keeps the
+   * prompt prefix stable.
+   */
   buildAgentToolsSystemInstruction(): string {
-    const sections: string[] = []
-    if (sandboxEnforces()) {
-      // Stating the limits up front is cheaper than letting the model discover
-      // them by having a command refused.
-      sections.push(
-        [
-          '# Shell',
-          'shell runs commands in an isolated scratch workspace under an OS',
-          'sandbox: it starts there, can only write there, and cannot read files',
-          "in the user's home directory. The workspace belongs to this",
-          'conversation alone and is deleted with it, so do not keep anything',
-          'there that should last. It has no network access, so commands that',
-          'download or upload will fail.',
-        ].join(' ')
-      )
-    }
-    if (this.pythonOffered) sections.push(PYTHON_SYSTEM_SECTION)
-    return sections.join('\n\n')
+    return this.pythonOffered ? PYTHON_SYSTEM_SECTION : ''
   }
 
   mapUserInlineAttachments(messages: UIMessage[]): UIMessage[] {
