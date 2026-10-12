@@ -289,3 +289,19 @@ describe('parseBashOutput', () => {
     expect(parseBashOutput(undefined).exit).toBeUndefined()
   })
 })
+
+describe('describeNativeToolCall for the python tool', () => {
+  it('shows the code the call is running', () => {
+    expect(
+      describeNativeToolCall(agent, 'python', { code: 'print(1)', timeout: 5 })
+    ).toEqual({ variant: 'python', code: 'print(1)' })
+  })
+
+  // The code streams in like any other argument.
+  it('accepts code that has not arrived yet', () => {
+    expect(describeNativeToolCall(agent, 'python', undefined)).toEqual({
+      variant: 'python',
+      code: '',
+    })
+  })
+})

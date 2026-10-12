@@ -64,5 +64,15 @@
     "patternPlaceholder": "mẫu",
     "namePlaceholder": "tên",
     "workspaceRoot": "thư mục gốc không gian làm việc"
+  },
+  "python": {
+    "title": "Python",
+    "code": "Code",
+    "output": "Output",
+    "files": "Files",
+    "saveAs": "Save as…",
+    "saved": "Saved to {{path}}",
+    "saveFailed": "Could not save: {{reason}}",
+    "moreFiles": "{{count}} more files"
   }
 }

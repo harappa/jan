@@ -1,6 +1,7 @@
 import type { ToolUIPart } from 'ai'
 import type { ToolOrigin } from './toolOrigin'
 import { isRecordedShellCall } from '@/lib/agentTools'
+import { PYTHON_TOOL_NAME } from '@/lib/pythonTool'
 
 /** The call is still being written or executed: no result yet. */
 export const isToolRunning = (state: ToolUIPart['state']) =>
@@ -16,6 +17,8 @@ export type ToolCallBar =
   | { variant: 'documents'; query: string; count?: number; fileCount?: number }
   /** `shell`, presented as a terminal. */
   | { variant: 'terminal'; command: string }
+  /** `python`, presented as a code block with its output and files. */
+  | { variant: 'python'; code: string }
   /**
    * The workspace tools. `target` is whatever the call is really about -- a path
    * for read/ls, the pattern for find/grep, the entry name for memory/skill --
@@ -133,6 +136,9 @@ export function describeNativeToolCall(
         variant: 'terminal',
         command: asString(args.command),
       }
+    }
+    if (toolName === PYTHON_TOOL_NAME) {
+      return { variant: 'python', code: asString(args.code) }
     }
     // find/grep are about their pattern, with the directory as context; the
     // others are about the single path or name they act on. `ls` defaults to the

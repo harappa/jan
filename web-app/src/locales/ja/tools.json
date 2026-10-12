@@ -64,5 +64,15 @@
     "patternPlaceholder": "パターン",
     "namePlaceholder": "名前",
     "workspaceRoot": "ワークスペースのルート"
+  },
+  "python": {
+    "title": "Python",
+    "code": "コード",
+    "output": "出力",
+    "files": "ファイル",
+    "saveAs": "名前を付けて保存…",
+    "saved": "{{path}} に保存しました",
+    "saveFailed": "保存できませんでした: {{reason}}",
+    "moreFiles": "ほか {{count}} 件"
   }
 }

@@ -29,6 +29,20 @@ vi.mock('../RagToolWidget', () => ({
   RagToolWidget: () => <div data-testid="rag-widget" />,
 }))
 
+vi.mock('../PythonWidget', () => ({
+  PythonWidget: ({
+    bar,
+    output,
+  }: {
+    bar: { code: string }
+    output?: string
+  }) => (
+    <div data-testid="python-widget">
+      {bar.code} output:{output}
+    </div>
+  ),
+}))
+
 import { ToolCallCard } from '../ToolCallCard'
 
 describe('ToolCallCard', () => {
@@ -73,6 +87,31 @@ describe('ToolCallCard', () => {
       />
     )
     expect(screen.getByText('title: Bug')).toBeInTheDocument()
+  })
+
+  // The python card shows the run itself, so the raw arguments are not
+  // previewed in the header a second time.
+  it('renders a python call as a python card', () => {
+    origin.mockReturnValue({ kind: 'agent' })
+    render(
+      <ToolCallCard
+        part={{
+          type: 'tool-python',
+          state: 'output-available',
+          toolCallId: 'tc3',
+          input: { code: 'print(6 * 7)' },
+          output: '42\n[exit 0]',
+        }}
+        messageId="m1"
+      />
+    )
+    expect(screen.getByTestId('python-widget')).toHaveTextContent(
+      'print(6 * 7)'
+    )
+    expect(screen.getByTestId('python-widget')).toHaveTextContent(
+      'output:42'
+    )
+    expect(screen.queryByText(/^code: /)).not.toBeInTheDocument()
   })
 
   /// The launch is over the moment the call settles, and the tasks panel follows

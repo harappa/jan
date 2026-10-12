@@ -16,6 +16,7 @@ import { isToolPart, type MessagePartLike } from './types'
 import { RagToolWidget } from './RagToolWidget'
 import { WebToolWidget } from './WebToolWidget'
 import { AgentToolWidget, TerminalWidget } from './AgentToolWidget'
+import { PythonWidget } from './PythonWidget'
 import { SubagentToolWidget } from './SubagentToolWidget'
 
 const identityResolver = (input: string) => Promise.resolve(input)
@@ -109,6 +110,13 @@ export const ToolCallCard = memo(
               />
             ) : bar.variant === 'terminal' ? (
               <TerminalWidget
+                bar={bar}
+                state={part.state}
+                output={part.output}
+                errorText={errorText}
+              />
+            ) : bar.variant === 'python' ? (
+              <PythonWidget
                 bar={bar}
                 state={part.state}
                 output={part.output}

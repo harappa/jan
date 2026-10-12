@@ -64,5 +64,15 @@
     "patternPlaceholder": "패턴",
     "namePlaceholder": "이름",
     "workspaceRoot": "워크스페이스 루트"
+  },
+  "python": {
+    "title": "Python",
+    "code": "Code",
+    "output": "Output",
+    "files": "Files",
+    "saveAs": "Save as…",
+    "saved": "Saved to {{path}}",
+    "saveFailed": "Could not save: {{reason}}",
+    "moreFiles": "{{count}} more files"
   }
 }

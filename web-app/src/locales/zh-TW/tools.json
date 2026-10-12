@@ -64,5 +64,15 @@
     "patternPlaceholder": "模式",
     "namePlaceholder": "名稱",
     "workspaceRoot": "工作區根目錄"
+  },
+  "python": {
+    "title": "Python",
+    "code": "Code",
+    "output": "Output",
+    "files": "Files",
+    "saveAs": "Save as…",
+    "saved": "Saved to {{path}}",
+    "saveFailed": "Could not save: {{reason}}",
+    "moreFiles": "{{count}} more files"
   }
 }

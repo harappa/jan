@@ -64,5 +64,15 @@
     "patternPlaceholder": "patró",
     "namePlaceholder": "nom",
     "workspaceRoot": "arrel de l’espai de treball"
+  },
+  "python": {
+    "title": "Python",
+    "code": "Code",
+    "output": "Output",
+    "files": "Files",
+    "saveAs": "Save as…",
+    "saved": "Saved to {{path}}",
+    "saveFailed": "Could not save: {{reason}}",
+    "moreFiles": "{{count}} more files"
   }
 }
