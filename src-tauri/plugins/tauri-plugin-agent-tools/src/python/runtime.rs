@@ -47,15 +47,29 @@ pub fn python_executable(runtime: &Path) -> PathBuf {
 ///
 /// Synchronous file I/O: call it from a blocking task.
 pub fn ensure_runtime(bundled: &Path, data_folder: &Path) -> Result<PathBuf, String> {
-    ensure_runtime_with(bundled, data_folder, &|| {})
+    ensure_runtime_with(
+        bundled,
+        data_folder,
+        &Seams {
+            after_dir: &|_| {},
+            before_rename: &|| {},
+        },
+    )
 }
 
-/// `ensure_runtime`, calling `before_rename` just before the finished copy is
-/// moved into place (a seam for tests to play another process finishing first).
+/// Points where a test can act as another process while the copy runs.
+struct Seams<'a> {
+    /// Called with each subfolder of the partial right after it is created.
+    after_dir: &'a dyn Fn(&Path),
+    /// Called just before the finished copy is moved into place.
+    before_rename: &'a dyn Fn(),
+}
+
+/// `ensure_runtime` with the test seams.
 fn ensure_runtime_with(
     bundled: &Path,
     data_folder: &Path,
-    before_rename: &dyn Fn(),
+    seams: &Seams,
 ) -> Result<PathBuf, String> {
     let target = runtime_dir(data_folder);
     if target.join(COMPLETE_MARKER).is_file() {
@@ -79,7 +93,7 @@ fn ensure_runtime_with(
     remove_dir_if_exists(&target)?;
 
     let partial = unique_partial_dir(&target);
-    let result = copy_and_publish(bundled, &partial, &target, before_rename);
+    let result = copy_and_publish(bundled, &partial, &target, seams);
     if result.is_err() {
         let _ = fs::remove_dir_all(&partial);
     }
@@ -90,12 +104,12 @@ fn copy_and_publish(
     bundled: &Path,
     partial: &Path,
     target: &Path,
-    before_rename: &dyn Fn(),
+    seams: &Seams,
 ) -> Result<PathBuf, String> {
-    copy_tree(bundled, partial)?;
+    copy_tree(bundled, partial, seams.after_dir)?;
     let marker = partial.join(COMPLETE_MARKER);
     fs::write(&marker, RUNTIME_ID).map_err(|e| io_error("write", &marker, &e))?;
-    before_rename();
+    (seams.before_rename)();
     if let Err(e) = fs::rename(partial, target) {
         // Another process may have finished the same copy first.
         if target.join(COMPLETE_MARKER).is_file() {
@@ -179,8 +193,16 @@ fn remove_dir_if_exists(dir: &Path) -> Result<(), String> {
 /// recreated as links (the runtime's `python3 -> python3.15` needs that); on
 /// Windows, where creating one may need a privilege and the runtime has none, they
 /// are left out.
-fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+///
+/// Only `dst` itself is created with `create_dir_all`; subfolders use `create_dir`,
+/// so if something removes the partial mid-copy (another Jan instance cleaning up
+/// leftovers) the copy fails instead of silently recreating a half-empty folder.
+fn copy_tree(src: &Path, dst: &Path, after_dir: &dyn Fn(&Path)) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| io_error("create", dst, &e))?;
+    copy_children(src, dst, after_dir)
+}
+
+fn copy_children(src: &Path, dst: &Path, after_dir: &dyn Fn(&Path)) -> Result<(), String> {
     let entries = fs::read_dir(src).map_err(|e| io_error("read", src, &e))?;
     for entry in entries {
         let entry = entry.map_err(|e| io_error("read", src, &e))?;
@@ -191,7 +213,9 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
         if file_type.is_symlink() {
             copy_symlink(&from, &to)?;
         } else if file_type.is_dir() {
-            copy_tree(&from, &to)?;
+            fs::create_dir(&to).map_err(|e| io_error("create", &to, &e))?;
+            after_dir(&to);
+            copy_children(&from, &to, after_dir)?;
         } else if file_type.is_file() {
             fs::copy(&from, &to).map_err(|e| io_error("copy", &from, &e))?;
         }
@@ -445,7 +469,15 @@ mod tests {
             fs::write(target.join("python/from-other.txt"), "other").unwrap();
             fs::write(target.join(COMPLETE_MARKER), RUNTIME_ID).unwrap();
         };
-        let dir = ensure_runtime_with(bundled.path(), data.path(), &finish_elsewhere).unwrap();
+        let dir = ensure_runtime_with(
+            bundled.path(),
+            data.path(),
+            &Seams {
+                after_dir: &|_| {},
+                before_rename: &finish_elsewhere,
+            },
+        )
+        .unwrap();
         assert_eq!(dir, target);
         // The other copy is kept untouched and our own partial is gone.
         assert!(target.join("python/from-other.txt").is_file());
@@ -467,7 +499,15 @@ mod tests {
             fs::create_dir_all(target.join("python")).unwrap();
             fs::write(target.join("python/junk.bin"), "junk").unwrap();
         };
-        assert!(ensure_runtime_with(bundled.path(), data.path(), &block).is_err());
+        assert!(ensure_runtime_with(
+            bundled.path(),
+            data.path(),
+            &Seams {
+                after_dir: &|_| {},
+                before_rename: &block,
+            },
+        )
+        .is_err());
         assert!(!target.join(COMPLETE_MARKER).exists());
         // Our partial is cleaned up on failure.
         let names: Vec<_> = fs::read_dir(target.parent().unwrap())
@@ -475,6 +515,45 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    #[test]
+    fn a_partial_removed_mid_copy_fails_instead_of_publishing_a_gap() {
+        let bundled = fake_bundled(RUNTIME_ID);
+        bundled.write("python/Lib/a/x.py", "# a");
+        bundled.write("python/Lib/b/y.py", "# b");
+        bundled.write("python/DLLs/z.pyd", "# z");
+        let data = Scratch::new();
+        let target = runtime_dir(data.path());
+        let parent = target.parent().unwrap().to_path_buf();
+        // Another process cleaning up leftovers deletes this call's partial once.
+        let removed = std::cell::Cell::new(false);
+        let remove_partials_elsewhere = |_: &Path| {
+            if !removed.replace(true) {
+                for entry in fs::read_dir(&parent).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.to_string_lossy().contains(".partial") {
+                        fs::remove_dir_all(path).unwrap();
+                    }
+                }
+            }
+        };
+        let result = ensure_runtime_with(
+            bundled.path(),
+            data.path(),
+            &Seams {
+                after_dir: &remove_partials_elsewhere,
+                before_rename: &|| {},
+            },
+        );
+        assert!(removed.get());
+        assert!(result.is_err(), "{result:?}");
+        assert!(!target.exists());
+        // The next call starts over and succeeds with every file present.
+        let dir = ensure_runtime(bundled.path(), data.path()).unwrap();
+        for rel in files_under(bundled.path()) {
+            assert!(dir.join(&rel).is_file(), "missing {}", rel.display());
+        }
     }
 
     #[test]
