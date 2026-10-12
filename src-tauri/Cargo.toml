@@ -83,6 +83,7 @@ tauri-app = [
     "tauri-plugin-vector-db/tauri",
     "tauri-plugin-websearch/tauri",
     "tauri-plugin-agent-tools/tauri",
+    "tauri-plugin-agent-tools/python-tool",
 ]
 mobile = [
     "tauri/protocol-asset",

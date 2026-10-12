@@ -40,6 +40,9 @@ tauri = [
   "dep:webview2-com",
   "dep:windows",
 ]
+# Sandboxed Python tool backed by `mxc-sdk`. Off for the headless CLI, which
+# neither needs it nor should link it; the desktop turns it on via `tauri-app`.
+python-tool = ["dep:mxc-sdk"]
 
 [dependencies]
 base64 = "0.22"
@@ -63,6 +66,8 @@ tauri = { version = "2.8.5", default-features = false, optional = true }
 # `provider` only; `default-features = false` keeps `tauri` out of the graph so
 # the headless CLI can use the web tools.
 tauri-plugin-websearch = { path = "../tauri-plugin-websearch", default-features = false }
+# Default features only (`microvm` etc. would add build-time network access).
+mxc-sdk = { version = "=1.0.0", optional = true }
 
 [build-dependencies]
 tauri-plugin = { version = "2.3.1", features = ["build"], optional = true }

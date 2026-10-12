@@ -12,6 +12,8 @@
 pub mod memory;
 pub mod permissions;
 pub mod preview;
+#[cfg(feature = "python-tool")]
+pub mod python;
 pub mod skills;
 pub mod tools;
 pub mod workspace;
