@@ -160,24 +160,103 @@ async fn the_home_folder_cannot_be_read() {
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
         .expect("home folder");
-    assert!(std::fs::read_dir(&home).unwrap().next().is_some());
+    // A file only the real home holds; removed on drop, also when the test fails.
+    let probe = HomeProbe::new(&home);
+    let probe_name = probe.name();
     let out = f
         .run(&format!(
-            "import os\n\
+            "import json, os\n\
              try:\n\
-             \x20   print('entries', len(os.listdir({})))\n\
+             \x20   open({probe}).read()\n\
+             \x20   print('probe read')\n\
              except OSError:\n\
-             \x20   print('denied')",
-            py_str(&home)
+             \x20   print('probe denied')\n\
+             try:\n\
+             \x20   print('entries', json.dumps(sorted(os.listdir({home}))))\n\
+             except OSError:\n\
+             \x20   print('listing denied')",
+            probe = py_str(&probe.0),
+            home = py_str(&home),
         ))
         .await;
-    // Windows refuses the listing; Bubblewrap does not mount the home at all
-    // (an empty placeholder at most).
-    assert!(
-        out.content == "denied\n[exit 0]" || out.content == "entries 0\n[exit 0]",
-        "{}",
-        out.content
+    let lines: Vec<&str> = out.content.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", out.content);
+    assert_eq!(lines[0], "probe denied", "{}", out.content);
+    assert_eq!(lines[2], "[exit 0]");
+    if cfg!(windows) {
+        // BaseContainer refuses the listing outright.
+        assert_eq!(lines[1], "listing denied", "{}", out.content);
+    } else if lines[1] != "listing denied" {
+        // Bubblewrap shows no real home content, only the empty folders it
+        // creates as mount points for granted paths below the home (the
+        // runtime and data folders often live there).
+        let names: Vec<String> =
+            serde_json::from_str(lines[1].strip_prefix("entries ").expect("a listing"))
+                .expect("json list");
+        let allowed = granted_names_below(&home, &f.spec);
+        assert!(!names.contains(&probe_name), "{names:?}");
+        for name in &names {
+            assert!(
+                allowed.contains(name),
+                "home shows {name:?}; only {allowed:?} may appear"
+            );
+        }
+    }
+}
+
+/// Runs without MXC: the helper that decides which home entries may show.
+#[test]
+fn granted_names_below_takes_the_first_component_inside_home() {
+    let home = PathBuf::from("base").join("home");
+    let spec = RunSpec {
+        runtime: home.join("jan-mxc-spike").join("rt"),
+        workspace: home.join(".local").join("share").join("Jan").join("ws"),
+        inputs: PathBuf::from("elsewhere").join("inputs"),
+        timeout_s: 30,
+    };
+    assert_eq!(
+        granted_names_below(&home, &spec),
+        vec![".local".to_string(), "jan-mxc-spike".to_string()]
     );
+}
+
+/// A uniquely named file directly in the home folder, removed on drop.
+struct HomeProbe(PathBuf);
+
+impl HomeProbe {
+    fn new(home: &Path) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = home.join(format!(
+            ".jan_mxc_home_probe_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "home secret").expect("write the home probe");
+        HomeProbe(path)
+    }
+
+    fn name(&self) -> String {
+        self.0.file_name().unwrap().to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for HomeProbe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The first path component below `home` of each folder the run is granted
+/// (workspace, runtime, inputs) that lies inside the home.
+fn granted_names_below(home: &Path, spec: &RunSpec) -> Vec<String> {
+    [&spec.workspace, &spec.runtime, &spec.inputs]
+        .into_iter()
+        .filter_map(|p| p.strip_prefix(home).ok())
+        .filter_map(|rel| rel.components().next())
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
