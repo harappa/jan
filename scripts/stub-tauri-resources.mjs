@@ -40,6 +40,7 @@ const triple = execFileSync('rustc', ['-vV'], { encoding: 'utf8' })
 for (const dir of [
   'src-tauri/resources/bin',
   'src-tauri/resources/pre-install',
+  'src-tauri/resources/python',
   'src-tauri/icons',
   'web-app/dist',
 ]) {
@@ -50,6 +51,13 @@ touch(path('src-tauri/resources/LICENSE'))
 touch(path('web-app/dist/index.html'))
 if (readdirSync(path('src-tauri/resources/pre-install')).length === 0) {
   touch(path('src-tauri/resources/pre-install/.gitkeep'))
+}
+
+// The bundle config globs `resources/python/**/*`, and a glob that matches
+// nothing is an error. A real runtime (scripts/download-python.mjs) replaces
+// the whole folder, so this marker never ships next to one.
+if (readdirSync(path('src-tauri/resources/python')).length === 0) {
+  touch(path('src-tauri/resources/python/.stub'))
 }
 
 // The executable suffix, and the ggml runtime that ships beside the engine

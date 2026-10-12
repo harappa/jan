@@ -42,7 +42,8 @@
     "resources": [
       "resources/LICENSE",
       "resources/bin/jan-llama-worker.exe",
-      "resources/bin/*.dll"
+      "resources/bin/*.dll",
+      "resources/python/**/*"
     ],
     "externalBin": [
       "resources/bin/bun",

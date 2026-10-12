@@ -26,7 +26,8 @@
     "resources": [
       "resources/LICENSE",
       "resources/bin/jan-llama-worker",
-      "resources/bin/lib*.so*"
+      "resources/bin/lib*.so*",
+      "resources/python/**/*"
     ],
     "externalBin": [
       "resources/bin/uv"
