@@ -4,6 +4,7 @@ import type { Chat, UIMessage } from "@ai-sdk/react";
 import type { ChatStatus } from "ai";
 import { CustomChatTransport } from "@/lib/custom-chat-transport";
 import { useMessageQueue } from "@/stores/message-queue-store";
+import { stopToolLoop } from "@/stores/tool-loop-store";
 
 /** A tool loop run for a thread after its stream finished. */
 export type ToolLoop = {
@@ -51,6 +52,8 @@ interface ChatSessionState {
     title?: string,
   ) => Chat<UIMessage>;
   getSessionData: (sessionId: string) => SessionData;
+  /** The session's data if it exists; unlike getSessionData, never creates it. */
+  peekSessionData: (sessionId: string) => SessionData | undefined;
   updateStatus: (sessionId: string, status: ChatStatus) => void;
   setSessionTitle: (sessionId: string, title?: string) => void;
   removeSession: (sessionId: string) => void;
@@ -149,6 +152,8 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
     }
     return standaloneData[sessionId];
   },
+  peekSessionData: (sessionId) =>
+    get().sessions[sessionId]?.data ?? standaloneData[sessionId],
   updateStatus: (sessionId, status) => {
     set((state) => {
       const existing = state.sessions[sessionId];
@@ -192,6 +197,10 @@ export const useChatSessions = create<ChatSessionState>((set, get) => ({
     });
   },
   removeSession: (sessionId) => {
+    // Stop the thread's tool loop while its data still exists; the route's
+    // own stop on unmount would only find the data gone.
+    stopToolLoop(sessionId);
+
     const existing = get().sessions[sessionId];
     if (!existing) {
       delete standaloneData[sessionId];

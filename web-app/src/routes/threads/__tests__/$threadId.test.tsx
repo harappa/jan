@@ -96,6 +96,7 @@ const h = vi.hoisted(() => {
   const chatSessionsState: any = {
     sessions: {},
     getSessionData: vi.fn(sessionDataFor),
+    peekSessionData: vi.fn((id: string) => sessionDataByThread[id]),
   }
   const useChatSessionsMock: any = (selector: any) => selector(chatSessionsState)
   useChatSessionsMock.getState = () => chatSessionsState
@@ -510,6 +511,9 @@ describe('ThreadDetail route', () => {
       delete h.sessionDataByThread[id]
     }
     h.chatSessionsState.getSessionData = vi.fn(h.sessionDataFor)
+    h.chatSessionsState.peekSessionData = vi.fn(
+      (id: string) => h.sessionDataByThread[id]
+    )
     useToolLoops.setState({ running: {} })
     h.messageQueueState.dequeue = vi.fn(() => null)
     h.messageQueueState.clearQueue = vi.fn()
@@ -1724,6 +1728,76 @@ describe('ThreadDetail route', () => {
           releases.tcX?.()
           releases.tcY?.()
         })
+        delete h.threadsState.threads['thread-2']
+      })
+
+      // Leaving a thread does not stop its stream; the turn finishes in the
+      // background and its onFinish must still find every call it collected.
+      it('a thread left while streaming runs all its calls when its stream finishes', async () => {
+        h.appStateState.mcpToolNames = new Set(['fetch'])
+        h.chatState.status = 'streaming'
+        h.threadsState.threads['thread-2'] = {
+          id: 'thread-2',
+          title: 'Other',
+          metadata: {},
+          assistants: [],
+          model: { id: 'gpt-x', provider: 'openai' },
+        }
+        const started: string[] = []
+        const callTool = vi.fn(({ arguments: args }: any) => {
+          started.push(args.id)
+          return Promise.resolve({ error: '', content: [] })
+        })
+        hub.mcp = () => ({ callTool }) as never
+        const Component = Route.component as React.ComponentType
+        const { rerender } = render(<Component />)
+        // X's Chat keeps these callbacks while the route shows Y.
+        const x = {
+          onToolCall: (h as any).capturedOnToolCall,
+          onFinish: (h as any).capturedOnFinish,
+        }
+        const arriveInX = async (id: string) => {
+          await act(async () => {
+            await x.onToolCall({
+              toolCall: { toolCallId: id, toolName: 'fetch', input: { id } },
+            })
+          })
+        }
+        await arriveInX('tcA')
+
+        h.routeThreadId = 'thread-2'
+        await act(async () => {
+          rerender(<Component />)
+        })
+        // Leaving X released its open approvals, as before.
+        expect(h.toolApprovalState.clearPendingForThread).toHaveBeenCalledWith(
+          'thread-1'
+        )
+
+        // X's stream goes on in the background and finishes.
+        await arriveInX('tcB')
+        await act(async () => {
+          await x.onFinish({
+            message: {
+              id: 'a-x',
+              role: 'assistant',
+              parts: [{ type: 'text', text: '' }],
+              metadata: { finishReason: 'tool-calls' },
+            },
+            isAbort: false,
+          })
+        })
+
+        expect(started).toEqual(['tcA', 'tcB'])
+        expect(
+          h.mockAddToolOutput.mock.calls.map((c: any[]) => c[0].toolCallId)
+        ).toEqual(['tcA', 'tcB'])
+        // tcA's released approval is asked for again by the loop.
+        expect(
+          h.toolApprovalState.requestApproval.mock.calls.filter(
+            (c: any[]) => c[0] === 'tcA'
+          ).length
+        ).toBe(2)
         delete h.threadsState.threads['thread-2']
       })
 

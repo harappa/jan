@@ -258,7 +258,8 @@ function ThreadDetail() {
   // for a stopped turn (which starts no loop).
   const followUpMessage = useCallback(
     ({ messages }: { messages: UIMessage[] }) => {
-      const loop = useChatSessions.getState().getSessionData(threadId).toolLoop
+      const loop =
+        useChatSessions.getState().peekSessionData(threadId)?.toolLoop
       if (!loop || loop.controller.signal.aborted) {
         return false
       }
@@ -1036,7 +1037,9 @@ function ThreadDetail() {
   // unresolved approval promise keeps that thread marked busy forever.
   useEffect(() => {
     return () => {
-      stopToolLoop(threadId)
+      // Leaving does not stop the thread's stream: keep the calls it has
+      // collected so far for its onFinish, which runs them in the background.
+      stopToolLoop(threadId, { keepCollected: true })
       // Drop per-thread timing/progress/diff state from the shared runtime
       // store. The cards for the thread we leave are unmounting, so a thread a
       // later visit cannot show another thread's diff. (code.tsx re-hydrates

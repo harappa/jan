@@ -14,6 +14,8 @@ import { useToolCallRuntime } from '@/hooks/useToolCallRuntime'
 
 const data = (threadId: string) =>
   useChatSessions.getState().getSessionData(threadId)
+const peek = (threadId: string) =>
+  useChatSessions.getState().peekSessionData(threadId)
 const running = (threadId: string) =>
   !!useToolLoops.getState().running[threadId]
 const busy = (threadId: string) =>
@@ -156,11 +158,68 @@ describe('stopToolLoop', () => {
     expect(busy('t1')).toBe(true)
   })
 
+  it('keeps the calls of a turn still streaming when asked to', () => {
+    data('t1').tools.push(call('a'))
+    const { loop } = startToolLoop('t1', noDeny)
+    data('t1').tools.push(call('s'))
+
+    stopToolLoop('t1', { keepCollected: true })
+
+    expect(loop.controller.signal.aborted).toBe(true)
+    expect(data('t1').toolLoop).toBeUndefined()
+    expect(data('t1').tools.map((c) => c.toolCallId)).toEqual(['s'])
+    expect(running('t1')).toBe(false)
+  })
+
   it('touches no other thread', () => {
     data('t2').tools.push(call('z'))
     const { loop } = startToolLoop('t2', noDeny)
     stopToolLoop('t1')
     expect(loop.controller.signal.aborted).toBe(false)
     expect(running('t2')).toBe(true)
+  })
+})
+
+describe('a deleted thread', () => {
+  const withSession = (threadId: string) => {
+    const chat = { status: 'ready', messages: [], stop: vi.fn() }
+    useChatSessions
+      .getState()
+      .ensureSession(threadId, {} as never, () => chat as never)
+    return chat
+  }
+
+  it('has its loop stopped and its approvals released by removeSession', async () => {
+    withSession('t1')
+    data('t1').tools.push(call('a'), call('b'))
+    const deny = vi.fn()
+    const { loop } = startToolLoop('t1', deny)
+    markToolCallReached(loop, 'a')
+    const approval = useToolApprovalRequests
+      .getState()
+      .requestApproval('a', 'fetch', 't1')
+
+    useChatSessions.getState().removeSession('t1')
+
+    expect(loop.controller.signal.aborted).toBe(true)
+    expect(deny).toHaveBeenCalledWith({ toolCallId: 'b', toolName: 'fetch' })
+    await expect(approval).resolves.toBe(false)
+    expect(useToolApprovalRequests.getState().pending).toEqual({})
+    expect(running('t1')).toBe(false)
+    expect(busy('t1')).toBe(false)
+  })
+
+  it('leaves no data behind when its loop ends or is stopped later', () => {
+    withSession('t1')
+    data('t1').tools.push(call('a'))
+    const { loop } = startToolLoop('t1', noDeny)
+    useChatSessions.getState().removeSession('t1')
+    expect(peek('t1')).toBeUndefined()
+
+    endToolLoop('t1', loop)
+    stopToolLoop('t1')
+    stopToolLoop('t1', { keepCollected: true })
+
+    expect(peek('t1')).toBeUndefined()
   })
 })

@@ -37,6 +37,10 @@ export const useToolLoops = create<ToolLoopsState>()((set) => ({
 
 const sessionData = (threadId: string) =>
   useChatSessions.getState().getSessionData(threadId)
+// For the exit and stop paths, which can run after the thread was deleted and
+// must not bring its data back.
+const existingSessionData = (threadId: string) =>
+  useChatSessions.getState().peekSessionData(threadId)
 
 /** The thread's approval promises, shared by onToolCall and the loop. */
 export function toolApprovalsFor(
@@ -98,19 +102,19 @@ function settleCalls(ids: string[], unstartedOnly: boolean) {
  * since a stopped loop can return after the next one started.
  */
 export function endToolLoop(threadId: string, loop: ToolLoop) {
-  const data = sessionData(threadId)
-  if (data.toolLoop === loop) {
+  const data = existingSessionData(threadId)
+  if (data && data.toolLoop === loop) {
     data.toolLoop = undefined
     useToolLoops.getState().setRunning(threadId, false)
     useAppState.getState().setThreadBusy(threadId, false)
   }
   settleCalls(loop.toolCallIds, false)
-  for (const id of loop.toolCallIds) data.toolApprovals?.delete(id)
+  for (const id of loop.toolCallIds) data?.toolApprovals?.delete(id)
 }
 
 /** Releases the approvals waiting on the thread, resolving them as denied. */
 export function releaseToolApprovals(threadId: string) {
-  sessionData(threadId).toolApprovals?.clear()
+  existingSessionData(threadId)?.toolApprovals?.clear()
   useToolApprovalRequests.getState().clearPendingForThread(threadId)
 }
 
@@ -118,17 +122,27 @@ export function releaseToolApprovals(threadId: string) {
  * Stops whatever the thread's tools are doing: aborts its loop (an aborted
  * loop runs no further call and asks for no follow-up), gives the calls it has
  * not reached the denied result so their cards do not keep showing them as
- * running, releases its approvals and drops the calls collected for the turn
- * being stopped, so they never run later. Safe to call when nothing runs.
+ * running, and releases its approvals. Safe to call when nothing runs.
+ *
+ * Unless `keepCollected` is set, it also drops the calls collected for the
+ * turn being stopped, so they never run later: a stop that also ends the
+ * stream wants that (the aborted finish then denies them). Leaving a thread
+ * does not end its stream, so the calls collected so far belong to a turn
+ * that is still streaming and must stay for its onFinish.
  *
  * The denied results go to the thread's own Chat (the loop's callbacks belong
  * to it), so this is safe also for a thread the route has just left.
  */
-export function stopToolLoop(threadId: string) {
-  const data = sessionData(threadId)
-  const loop = data.toolLoop
-  data.toolLoop = undefined
-  data.tools = []
+export function stopToolLoop(
+  threadId: string,
+  { keepCollected = false }: { keepCollected?: boolean } = {}
+) {
+  const data = existingSessionData(threadId)
+  const loop = data?.toolLoop
+  if (data) {
+    data.toolLoop = undefined
+    if (!keepCollected) data.tools = []
+  }
   if (loop) {
     loop.controller.abort()
     const unreached = loop.unreached
