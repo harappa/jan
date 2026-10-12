@@ -102,6 +102,7 @@ import { Shimmer } from '@/components/ai-elements/shimmer'
 import { useMessageQueue } from '@/stores/message-queue-store'
 import {
   endToolLoop,
+  markToolCallReached,
   releaseToolApprovals,
   startToolLoop,
   stopToolLoop,
@@ -579,7 +580,10 @@ function ThreadDetail() {
       // The loop takes the collected calls over, so the calls of a later turn
       // never mix with them, even when this loop is stopped and still waiting
       // on its tool when that turn arrives.
-      const { loop, toolCalls: toolsToRun } = startToolLoop(threadId)
+      const { loop, toolCalls: toolsToRun } = startToolLoop(
+        threadId,
+        (toolCall) => addToolOutput(deniedToolOutput(toolCall))
+      )
       const signal = loop.controller.signal
       const approvals = toolApprovalsFor(threadId)
 
@@ -596,6 +600,7 @@ function ThreadDetail() {
           if (signal.aborted) {
             break
           }
+          markToolCallReached(loop, toolCall.toolCallId)
 
           try {
             const toolName = toolCall.toolName

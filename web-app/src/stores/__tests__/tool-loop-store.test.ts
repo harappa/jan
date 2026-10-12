@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
   endToolLoop,
+  markToolCallReached,
   startToolLoop,
   stopToolLoop,
   toolApprovalsFor,
@@ -18,6 +19,7 @@ const running = (threadId: string) =>
 const busy = (threadId: string) =>
   !!useAppState.getState().busyThreads[threadId]
 const call = (id: string) => ({ toolCallId: id, toolName: 'fetch', input: {} })
+const noDeny = () => {}
 
 beforeEach(() => {
   useChatSessions.getState().clearSessions()
@@ -30,7 +32,7 @@ beforeEach(() => {
 describe('startToolLoop', () => {
   it('takes the collected calls, so calls arriving later start a new list', () => {
     data('t1').tools.push(call('a'), call('b'))
-    const { loop, toolCalls } = startToolLoop('t1')
+    const { loop, toolCalls } = startToolLoop('t1', noDeny)
 
     expect(toolCalls.map((c) => c.toolCallId)).toEqual(['a', 'b'])
     expect(loop.toolCallIds).toEqual(['a', 'b'])
@@ -43,7 +45,7 @@ describe('startToolLoop', () => {
 
 describe('endToolLoop', () => {
   it('clears the thread state when the loop still owns it', () => {
-    const { loop } = startToolLoop('t1')
+    const { loop } = startToolLoop('t1', noDeny)
     endToolLoop('t1', loop)
 
     expect(data('t1').toolLoop).toBeUndefined()
@@ -53,12 +55,12 @@ describe('endToolLoop', () => {
 
   it('leaves a newer loop and the calls collected since alone', () => {
     data('t1').tools.push(call('a'))
-    const { loop: first } = startToolLoop('t1')
+    const { loop: first } = startToolLoop('t1', noDeny)
     stopToolLoop('t1')
     data('t1').tools.push(call('c'))
     const pendingC = Promise.resolve(true)
     toolApprovalsFor('t1').set('c', pendingC)
-    const { loop: second } = startToolLoop('t1')
+    const { loop: second } = startToolLoop('t1', noDeny)
     data('t1').tools.push(call('d'))
 
     endToolLoop('t1', first)
@@ -72,7 +74,7 @@ describe('endToolLoop', () => {
 
   it('settles only its own calls, keeping the end time of finished ones', () => {
     data('t1').tools.push(call('a'), call('b'))
-    const { loop } = startToolLoop('t1')
+    const { loop } = startToolLoop('t1', noDeny)
     const runtime = useToolCallRuntime.getState()
     runtime.enqueue(['a', 'b'])
     runtime.markRunning('a')
@@ -92,7 +94,7 @@ describe('endToolLoop', () => {
   it('drops the approval promises of its own calls only', () => {
     data('t1').tools.push(call('a'))
     toolApprovalsFor('t1').set('a', Promise.resolve(true))
-    const { loop } = startToolLoop('t1')
+    const { loop } = startToolLoop('t1', noDeny)
     toolApprovalsFor('t1').set('c', Promise.resolve(true))
 
     endToolLoop('t1', loop)
@@ -104,8 +106,9 @@ describe('endToolLoop', () => {
 describe('stopToolLoop', () => {
   it('aborts the loop and releases everything the thread holds', async () => {
     data('t1').tools.push(call('a'), call('b'))
-    const { loop } = startToolLoop('t1')
+    const { loop } = startToolLoop('t1', noDeny)
     useToolCallRuntime.getState().enqueue(['a', 'b'])
+    markToolCallReached(loop, 'a')
     useToolCallRuntime.getState().markRunning('a')
     data('t1').tools.push(call('c'))
     toolApprovalsFor('t1').set('c', Promise.resolve(true))
@@ -131,6 +134,21 @@ describe('stopToolLoop', () => {
     expect(timings.a.endedAt).toBeUndefined()
   })
 
+  it('gives the calls the loop has not reached the denied result, once', () => {
+    data('t1').tools.push(call('a'), call('b'), call('c'))
+    const deny = vi.fn()
+    const { loop } = startToolLoop('t1', deny)
+    markToolCallReached(loop, 'a')
+
+    stopToolLoop('t1')
+    stopToolLoop('t1')
+
+    expect(deny.mock.calls).toEqual([
+      [{ toolCallId: 'b', toolName: 'fetch' }],
+      [{ toolCallId: 'c', toolName: 'fetch' }],
+    ])
+  })
+
   it('does not clear a busy mark it does not own', () => {
     // Attachments being embedded mark the thread busy without a tool loop.
     useAppState.getState().setThreadBusy('t1', true)
@@ -140,7 +158,7 @@ describe('stopToolLoop', () => {
 
   it('touches no other thread', () => {
     data('t2').tools.push(call('z'))
-    const { loop } = startToolLoop('t2')
+    const { loop } = startToolLoop('t2', noDeny)
     stopToolLoop('t1')
     expect(loop.controller.signal.aborted).toBe(false)
     expect(running('t2')).toBe(true)

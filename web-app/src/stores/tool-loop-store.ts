@@ -1,5 +1,9 @@
 import { create } from 'zustand'
-import { useChatSessions, type ToolLoop } from '@/stores/chat-session-store'
+import {
+  useChatSessions,
+  type ToolCallRef,
+  type ToolLoop,
+} from '@/stores/chat-session-store'
 import { useAppState } from '@/hooks/useAppState'
 import { useToolApprovalRequests } from '@/hooks/useToolApprovalRequests'
 import { useToolCallRuntime } from '@/hooks/useToolCallRuntime'
@@ -46,15 +50,24 @@ export function toolApprovalsFor(
 /**
  * Starts the thread's loop over the calls collected so far. They move to the
  * loop: calls of a later turn are collected in a fresh list, so a stopped loop
- * and the next turn never share one.
+ * and the next turn never share one. `deny` gives a call the denied result; a
+ * stop uses it for the calls the loop has not reached.
  */
-export function startToolLoop(threadId: string) {
+export function startToolLoop(
+  threadId: string,
+  deny: (toolCall: ToolCallRef) => void
+) {
   const data = sessionData(threadId)
   const toolCalls = data.tools
   data.tools = []
   const loop: ToolLoop = {
     controller: new AbortController(),
     toolCallIds: toolCalls.map((tc) => tc.toolCallId),
+    unreached: toolCalls.map((tc) => ({
+      toolCallId: tc.toolCallId,
+      toolName: tc.toolName,
+    })),
+    deny,
   }
   data.toolLoop = loop
   useToolLoops.getState().setRunning(threadId, true)
@@ -62,6 +75,11 @@ export function startToolLoop(threadId: string) {
   // streaming has already ended.
   useAppState.getState().setThreadBusy(threadId, true)
   return { loop, toolCalls }
+}
+
+/** The loop has reached this call: from here on the loop gives its result. */
+export function markToolCallReached(loop: ToolLoop, toolCallId: string) {
+  loop.unreached = loop.unreached.filter((tc) => tc.toolCallId !== toolCallId)
 }
 
 /** Ends calls of `ids` that have not ended, optionally only unstarted ones. */
@@ -98,9 +116,13 @@ export function releaseToolApprovals(threadId: string) {
 
 /**
  * Stops whatever the thread's tools are doing: aborts its loop (an aborted
- * loop runs no further call and asks for no follow-up), releases its approvals
- * and drops the calls collected for the turn being stopped, so they never run
- * later. Safe to call when nothing runs.
+ * loop runs no further call and asks for no follow-up), gives the calls it has
+ * not reached the denied result so their cards do not keep showing them as
+ * running, releases its approvals and drops the calls collected for the turn
+ * being stopped, so they never run later. Safe to call when nothing runs.
+ *
+ * The denied results go to the thread's own Chat (the loop's callbacks belong
+ * to it), so this is safe also for a thread the route has just left.
  */
 export function stopToolLoop(threadId: string) {
   const data = sessionData(threadId)
@@ -109,6 +131,9 @@ export function stopToolLoop(threadId: string) {
   data.tools = []
   if (loop) {
     loop.controller.abort()
+    const unreached = loop.unreached
+    loop.unreached = []
+    for (const toolCall of unreached) loop.deny(toolCall)
     // The call in flight keeps timing until its executor returns.
     settleCalls(loop.toolCallIds, true)
     // Only the loop's own busy mark: embedding attachments sets one too.

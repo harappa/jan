@@ -10,7 +10,13 @@ export type ToolLoop = {
   controller: AbortController;
   /** The calls this loop took over, to settle only its own on exit. */
   toolCallIds: string[];
+  /** Calls the loop has not reached yet; a stop gives each the denied result. */
+  unreached: ToolCallRef[];
+  /** Gives a call the result of a denied one. */
+  deny: (toolCall: ToolCallRef) => void;
 };
+
+export type ToolCallRef = { toolCallId: string; toolName: string };
 
 export type SessionData = {
   tools: any[];
@@ -57,6 +63,8 @@ const STREAMING_STATUSES: ChatStatus[] = [
 ];
 
 // Pure helper function for checking if a session is busy (for reactive use in components)
+// Reports streaming, or calls collected and not yet taken over by a tool loop
+// (a running loop is not counted; see stores/tool-loop-store.ts).
 export function isSessionBusy(session: ChatSession | undefined): boolean {
   return session?.isStreaming || (session?.data?.tools?.length ?? 0) > 0;
 }

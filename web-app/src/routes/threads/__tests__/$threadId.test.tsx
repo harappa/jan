@@ -1387,19 +1387,72 @@ describe('ThreadDetail route', () => {
         )
         expect(toolsRunningFlag()).toBe('false')
 
-        // The in-flight call finishes afterwards; tcB must never start.
+        // The in-flight call finishes afterwards; tcB must never start and
+        // only gets the denied result.
         await act(async () => {
           releases.tcA()
         })
         expect(started).toEqual(['tcA'])
         expect(
-          h.mockAddToolOutput.mock.calls.map((c: any[]) => c[0].toolCallId)
-        ).not.toContain('tcB')
+          h.mockAddToolOutput.mock.calls
+            .map((c: any[]) => c[0])
+            .filter((o: any) => o.toolCallId === 'tcB')
+        ).toEqual([
+          {
+            state: 'output-error',
+            tool: 'fetch',
+            toolCallId: 'tcB',
+            errorText: 'Tool execution denied by user',
+          },
+        ])
         expect(h.appStateState.setThreadBusy).toHaveBeenLastCalledWith(
           'thread-1',
           false
         )
         expect(toolsRunningFlag()).toBe('false')
+      })
+
+      it('a stop on the first call gives both queued calls the denied result and runs neither', async () => {
+        h.appStateState.mcpToolNames = new Set(['fetch'])
+        const { started, releases } = hangingAll()
+        renderComponent()
+        await arriveWithIds('tcA', 'tcB', 'tcC')
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+        expect(started).toEqual(['tcA'])
+
+        await act(async () => {
+          screen.getByTestId('chat-stop').click()
+        })
+        const denied = (id: string) => ({
+          state: 'output-error',
+          tool: 'fetch',
+          toolCallId: id,
+          errorText: 'Tool execution denied by user',
+        })
+        // At once, not only when the call in flight returns.
+        expect(h.mockAddToolOutput.mock.calls).toEqual([
+          [denied('tcB')],
+          [denied('tcC')],
+        ])
+
+        await act(async () => {
+          releases.tcA()
+        })
+        expect(started).toEqual(['tcA'])
+        const outputs = h.mockAddToolOutput.mock.calls.map((c: any[]) => c[0])
+        expect(outputs.filter((o: any) => o.toolCallId !== 'tcA')).toEqual([
+          denied('tcB'),
+          denied('tcC'),
+        ])
+        // The call in flight keeps its own result.
+        expect(outputs.find((o: any) => o.toolCallId === 'tcA')).toEqual({
+          tool: 'fetch',
+          toolCallId: 'tcA',
+          output: [],
+        })
+        expect(useToolCallRuntime.getState().queue).toEqual([])
       })
 
       // Evaluated while the stopped loop is still alive (its tool in flight):
@@ -1624,7 +1677,7 @@ describe('ThreadDetail route', () => {
         const { started, releases } = hangingAll()
         const Component = Route.component as React.ComponentType
         const { rerender } = render(<Component />)
-        await arriveWithIds('tcA')
+        await arriveWithIds('tcA', 'tcB')
         await act(async () => {
           await finishWithToolCalls()
         })
@@ -1634,6 +1687,14 @@ describe('ThreadDetail route', () => {
         h.routeThreadId = 'thread-2'
         await act(async () => {
           rerender(<Component />)
+        })
+        // Leaving X stopped its loop: the call it had not reached is denied
+        // (through X's own Chat, whose callbacks the loop holds).
+        expect(h.mockAddToolOutput).toHaveBeenCalledWith({
+          state: 'output-error',
+          tool: 'fetch',
+          toolCallId: 'tcB',
+          errorText: 'Tool execution denied by user',
         })
         await arriveWithIds('tcY')
         await act(async () => {
