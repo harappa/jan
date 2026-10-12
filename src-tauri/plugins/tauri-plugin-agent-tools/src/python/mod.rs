@@ -1,3 +1,4 @@
+//! Sandboxed Python tool: runtime install, input staging, execution and result files.
 pub mod availability;
 pub mod inputs;
 pub mod names;
