@@ -188,8 +188,9 @@ const isMarker = (line: string): boolean =>
 /**
  * Split a python result into the program's output and the markers Rust adds
  * after it (see `python::run::format_result`). The markers are one contiguous
- * run of lines at the very end, starting at `[exit N]`; the same text earlier
- * in the output is the program's own and stays in the body.
+ * run of lines at the very end, starting at `[exit N]` (or at
+ * `[terminated by signal]` for a killed run); the same text earlier in the
+ * output is the program's own and stays in the body.
  */
 export function parsePythonOutput(output: string): ParsedPythonOutput {
   const lines = output.split('\n').map((l) => l.replace(/\r$/, ''))
