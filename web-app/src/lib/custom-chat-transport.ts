@@ -41,6 +41,13 @@ import {
   refreshMemoryDigest,
   sandboxEnforces,
 } from '@/lib/agentTools'
+import {
+  PYTHON_SYSTEM_SECTION,
+  PYTHON_TOOL_DESCRIPTION,
+  PYTHON_TOOL_INPUT_SCHEMA,
+  PYTHON_TOOL_NAME,
+  getPythonStatus,
+} from '@/lib/pythonTool'
 import { useAppState, type ModelLoadProgress } from '@/hooks/useAppState'
 import { unloadLlamaModel, getLoadedModels } from '@janhq/tauri-plugin-llamacpp-api'
 import { engineFailure } from '@/lib/engineError'
@@ -865,6 +872,9 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
   private onTokenUsage?: TokenUsageCallback
   private hasDocuments = false
   private modelSupportsTools = false
+  // Set by refreshTools when the sandboxed python tool is among the tools, so
+  // the system prompt (built synchronously) mentions it exactly when it is offered.
+  private pythonOffered = false
   private ragFeatureAvailable = false
   protected systemMessage?: string
   protected serviceHub: ServiceHub | null
@@ -1017,6 +1027,7 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
     // sync, so it reads the snapshot this await guarantees. Error-safe and
     // cached inside agentTools, so this is one IPC round-trip per store change.
     await refreshMemoryDigest()
+    this.pythonOffered = false
     if (!this.serviceHub) {
       this.tools = {}
       return
@@ -1190,6 +1201,18 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
         }
       } catch (error) {
         console.warn('Failed to load agent tools:', error)
+      }
+
+      // The sandboxed python tool. Its availability is asked once per app run
+      // (cached), so the tool set and the prompt stay the same from turn to turn.
+      if ((await getPythonStatus()).available) {
+        toolsRecord[PYTHON_TOOL_NAME] = {
+          description: PYTHON_TOOL_DESCRIPTION,
+          inputSchema: jsonSchema(
+            PYTHON_TOOL_INPUT_SCHEMA as unknown as Record<string, unknown>
+          ),
+        } as Tool
+        this.pythonOffered = true
       }
     }
 
@@ -1835,18 +1858,24 @@ export class CustomChatTransport implements ChatTransport<UIMessage> {
   }
 
   buildAgentToolsSystemInstruction(): string {
-    if (!sandboxEnforces()) return ''
-    // Stating the limits up front is cheaper than letting the model discover
-    // them by having a command refused.
-    return [
-      '# Shell',
-      'shell runs commands in an isolated scratch workspace under an OS',
-      'sandbox: it starts there, can only write there, and cannot read files',
-      "in the user's home directory. The workspace belongs to this",
-      'conversation alone and is deleted with it, so do not keep anything',
-      'there that should last. It has no network access, so commands that',
-      'download or upload will fail.',
-    ].join(' ')
+    const sections: string[] = []
+    if (sandboxEnforces()) {
+      // Stating the limits up front is cheaper than letting the model discover
+      // them by having a command refused.
+      sections.push(
+        [
+          '# Shell',
+          'shell runs commands in an isolated scratch workspace under an OS',
+          'sandbox: it starts there, can only write there, and cannot read files',
+          "in the user's home directory. The workspace belongs to this",
+          'conversation alone and is deleted with it, so do not keep anything',
+          'there that should last. It has no network access, so commands that',
+          'download or upload will fail.',
+        ].join(' ')
+      )
+    }
+    if (this.pythonOffered) sections.push(PYTHON_SYSTEM_SECTION)
+    return sections.join('\n\n')
   }
 
   mapUserInlineAttachments(messages: UIMessage[]): UIMessage[] {
