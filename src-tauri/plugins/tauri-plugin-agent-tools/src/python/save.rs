@@ -19,10 +19,6 @@ const SEPARATORS: [char; 2] = ['/', '\\'];
 #[cfg(not(windows))]
 const SEPARATORS: [char; 1] = ['/'];
 
-/// Opens the reparse point itself instead of what it points to (Windows).
-#[cfg(windows)]
-const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a path component is an ordinary file name on this OS.
@@ -94,36 +90,108 @@ pub fn resolve_workspace_file(workspace: &Path, relative: &str) -> Result<PathBu
     Ok(resolved)
 }
 
-/// Open `source` for reading and check that the handle is the regular, link-free file the path
-/// names. `source` must be a path from [`resolve_workspace_file`].
-fn open_verified(source: &Path) -> Result<File, String> {
+/// The path the OS says an open file really lives at (links resolved), as the canonical form
+/// `canonicalize` gives, so it can be compared with a path from [`resolve_workspace_file`].
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn handle_path(file: &File) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(target_os = "macos")]
+fn handle_path(file: &File) -> io::Result<PathBuf> {
+    use nix::libc;
+    use std::ffi::OsStr;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `F_GETPATH` writes a NUL-terminated path of at most PATH_MAX bytes into `buf`.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(PathBuf::from(OsStr::from_bytes(&buf[..len])))
+}
+
+#[cfg(windows)]
+fn handle_path(file: &File) -> io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+    let handle = file.as_raw_handle();
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: `handle` is open for the duration of the call; `buf` has `buf.len()` units.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buf[..n])));
+        }
+        // Too small: `n` is the size needed, including the terminating NUL.
+        buf.resize(n, 0);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn handle_path(_file: &File) -> io::Result<PathBuf> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+/// Unix file systems compare paths exactly, Windows ones ignore case.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+/// Open `source` for reading and check that the handle really is the regular file the path
+/// names. `source` must be a path from [`resolve_workspace_file`]: canonical, so no component is
+/// a link and, being under the workspace, the file is inside it. `after_check` runs between the
+/// path check and the open (a test seam; a sandboxed run can swap things at exactly that point).
+fn open_verified(source: &Path, after_check: impl FnOnce()) -> Result<File, String> {
     let gone = || "The file is no longer in the workspace.".to_string();
     // A path that was link-free when resolved still is; a parent swapped for a link is not.
     let canonical = source.canonicalize().map_err(|_| gone())?;
-    if canonical != source {
+    if !same_path(&canonical, source) {
         return Err(gone());
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // A link swapped in for the file is opened as the link itself, and refused below.
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    after_check();
+    let file = OpenOptions::new()
+        .read(true)
+        .open(&canonical)
+        .map_err(|_| gone())?;
+    // The check above and the open are not atomic: a parent folder swapped for a link in
+    // between would make `open` follow it out of the workspace. Ask the OS where the open handle
+    // really is; that is the only answer a swap after this point cannot change.
+    let actual = handle_path(&file).map_err(|_| gone())?;
+    if !same_path(&actual, &canonical) {
+        return Err(gone());
     }
-    let file = options.open(&canonical).map_err(|_| gone())?;
     let opened = file.metadata().map_err(|_| gone())?;
-    // `symlink_metadata` does not follow a final link, so a link swapped in is not a file.
-    let named = std::fs::symlink_metadata(&canonical).map_err(|_| gone())?;
-    if !opened.is_file() || !named.is_file() {
+    if !opened.is_file() {
         return Err("The path is not a file.".to_string());
     }
-    // The handle must be the very file the link-free path names. (On Windows the file index
-    // needs unstable std APIs; opening the reparse point itself above covers a swapped link.)
+    // Extra guard: the handle is the very file the path names now.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+        let named = std::fs::symlink_metadata(&canonical).map_err(|_| gone())?;
+        if !named.is_file() || (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
             return Err("The file changed while it was being opened.".to_string());
         }
     }
@@ -164,11 +232,20 @@ pub fn save_with(
     source: &Path,
     pick: impl FnOnce(&str) -> Option<PathBuf>,
 ) -> Result<Option<PathBuf>, String> {
+    save_inner(source, pick, || {})
+}
+
+/// [`save_with`], plus the test seam of [`open_verified`].
+fn save_inner(
+    source: &Path,
+    pick: impl FnOnce(&str) -> Option<PathBuf>,
+    after_check: impl FnOnce(),
+) -> Result<Option<PathBuf>, String> {
     let name = source
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| "The file has no name.".to_string())?;
-    let mut file = open_verified(source)?;
+    let mut file = open_verified(source, after_check)?;
     let Some(dest) = pick(&name) else {
         return Ok(None);
     };
@@ -528,6 +605,59 @@ mod tests {
         .unwrap_err();
         assert!(!asked, "the dialog must not open for a swapped file: {err}");
         assert!(!root.path().join("saved.txt").exists());
+    }
+
+    /// Make `link` a folder link to `target`: a symlink on Unix, a junction (no admin rights) on
+    /// Windows.
+    fn link_dir(link: &Path, target: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "mklink failed");
+        }
+    }
+
+    #[test]
+    fn a_parent_swapped_for_a_link_between_the_check_and_the_open_is_refused() {
+        let (root, ws) = workspace();
+        let source = resolve_workspace_file(&ws, "sub/a.txt").unwrap();
+        // The folder `sub` is replaced by a link to a folder outside the workspace holding a
+        // file of the same name, after the path check and before the open.
+        root.write("elsewhere/a.txt", "other");
+        let dest = root.path().join("saved.txt");
+        let mut asked = false;
+        let err = save_inner(
+            &source,
+            |_| {
+                asked = true;
+                Some(dest.clone())
+            },
+            || {
+                fs::rename(ws.join("sub"), ws.join("sub.old")).unwrap();
+                link_dir(&ws.join("sub"), &root.path().join("elsewhere"));
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("no longer"), "{err}");
+        assert!(!asked, "the dialog must not open for a swapped parent");
+        assert!(!dest.exists(), "nothing may be written");
+    }
+
+    #[test]
+    fn the_open_handle_reports_the_path_it_was_opened_by() {
+        let (_root, ws) = workspace();
+        let source = resolve_workspace_file(&ws, "sub/a.txt").unwrap();
+        let file = File::open(&source).unwrap();
+        assert!(same_path(&handle_path(&file).unwrap(), &source));
     }
 
     #[cfg(unix)]
