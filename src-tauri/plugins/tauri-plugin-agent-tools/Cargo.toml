@@ -39,10 +39,14 @@ tauri = [
   # Windows screenshot backend (WebView2 CapturePreview -> IStream PNG).
   "dep:webview2-com",
   "dep:windows",
+  # The python tool's save dialog. Only the Tauri commands use it, and the
+  # desktop links it anyway; on Linux it needs the GUI libraries, which the
+  # python module alone does not.
+  "dep:rfd",
 ]
 # Sandboxed Python tool backed by `mxc-sdk`. Off for the headless CLI, which
 # neither needs it nor should link it; the desktop turns it on via `tauri-app`.
-python-tool = ["dep:mxc-sdk", "dep:rfd"]
+python-tool = ["dep:mxc-sdk"]
 
 [dependencies]
 base64 = "0.22"
@@ -71,8 +75,8 @@ tauri = { version = "2.8.5", default-features = false, optional = true }
 tauri-plugin-websearch = { path = "../tauri-plugin-websearch", default-features = false }
 # Default features only (`microvm` etc. would add build-time network access).
 mxc-sdk = { version = "=1.0.0", optional = true }
-# The native dialog that picks where a python result file is saved. Same version
-# and features as the desktop app's own `rfd`.
+# The native dialog that picks where a python result file is saved (enabled by
+# the `tauri` feature). Same version and features as the desktop app's own `rfd`.
 rfd = { version = "0.15.4", optional = true, default-features = false, features = [
   "tokio",
   "xdg-portal",
