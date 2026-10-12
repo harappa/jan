@@ -533,3 +533,79 @@ export async function stopSessionMonitors(threadId: string): Promise<void> {
 export async function cancelThreadBash(threadId: string): Promise<void> {
   await invoke('plugin:agent-tools|cancel_thread_bash', { threadId })
 }
+
+/** Whether the sandboxed `python` tool can run on this machine. */
+export type PythonStatus = {
+  available: boolean
+  /** Why it cannot run (English, for logs and the settings screen); null when available. */
+  reason: string | null
+}
+
+/**
+ * A file the user attached to the conversation, to be copied into the run as a
+ * read-only input: either a file on disk (`path`) or text the app already holds
+ * (`content`). `name` is the name the code sees (made safe and unique by Jan).
+ */
+export type PythonAttachment = {
+  name: string
+  path?: string | null
+  content?: string | null
+}
+
+/**
+ * Report whether the python tool can run. Callers should advertise `python` to
+ * a model only when `available`. Never rejects: an unusable setup (no bundled
+ * runtime in a dev build, no sandbox on this OS) is reported as `available: false`.
+ */
+export async function pythonStatus(): Promise<PythonStatus> {
+  return await invoke('plugin:agent-tools|python_status')
+}
+
+/**
+ * Run `code` in `threadId`'s sandbox. `timeoutS` is kept within 1..300 seconds
+ * (30 when omitted). `attachments` are copied in as read-only inputs.
+ *
+ * A failure (a run already going in this chat, no runtime, a staging error) is
+ * a resolved `ToolResult` with `isError` and an `ERROR: ...` content, so the
+ * model can read why; the promise rejects only if the IPC call itself fails.
+ */
+export async function pythonRun(
+  dataFolder: string,
+  threadId: string,
+  code: string,
+  timeoutS?: number,
+  attachments: PythonAttachment[] = []
+): Promise<ToolResult> {
+  return await invoke('plugin:agent-tools|python_run', {
+    dataFolder,
+    threadId,
+    code,
+    timeoutS,
+    attachments,
+  })
+}
+
+/** Stop the chat's python run (the Stop button). Resolves to whether it had one. */
+export async function pythonCancel(threadId: string): Promise<boolean> {
+  return await invoke('plugin:agent-tools|python_cancel', { threadId })
+}
+
+/**
+ * Save a file a run left in the workspace (`relativePath` is as printed in a
+ * `[file: ...]` line). Jan opens the native "save as" dialog itself; the
+ * frontend never chooses the destination. Resolves to the saved path, or null
+ * when the user cancelled the dialog. Rejects with the reason (an
+ * `{ message }` error) when the file cannot be saved, or while a run is active
+ * in this chat.
+ */
+export async function pythonSaveFile(
+  dataFolder: string,
+  threadId: string,
+  relativePath: string
+): Promise<string | null> {
+  return await invoke('plugin:agent-tools|python_save_file', {
+    dataFolder,
+    threadId,
+    relativePath,
+  })
+}

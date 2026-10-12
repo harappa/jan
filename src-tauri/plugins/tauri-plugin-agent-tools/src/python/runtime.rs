@@ -152,8 +152,8 @@ fn remove_partials(target: &Path) -> Result<(), String> {
 }
 
 /// The bundled folder must hold this build's runtime. In builds where it was not
-/// fetched (CI, `make dev`) it holds only a stub file.
-fn check_bundled(bundled: &Path) -> Result<(), String> {
+/// fetched (CI, `make dev`) it holds only a stub file. The error says why not.
+pub fn check_bundled(bundled: &Path) -> Result<(), String> {
     let id_path = bundled.join(ID_FILE);
     let id = match fs::read_to_string(&id_path) {
         Ok(id) => id,

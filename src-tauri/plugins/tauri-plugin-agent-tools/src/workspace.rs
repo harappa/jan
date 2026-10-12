@@ -491,12 +491,25 @@ async fn ensure_workspace_at(dir: PathBuf) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Delete a thread's sandbox. Idempotent: a missing sandbox is Ok.
+/// Delete a thread's sandbox (and, with the python tool, its staged inputs).
+/// Idempotent: a missing sandbox is Ok.
 pub async fn remove_thread_workspace(
     jan_data_folder: &Path,
     thread_id: &str,
 ) -> Result<(), String> {
-    remove_workspace_at(thread_workspace(jan_data_folder, thread_id)?, thread_id).await
+    remove_workspace_at(thread_workspace(jan_data_folder, thread_id)?, thread_id).await?;
+    // The python tool stages a thread's attachments beside the workspaces, not
+    // inside them, so they need their own removal. Idempotent like the above.
+    #[cfg(feature = "python-tool")]
+    {
+        let inputs = crate::python::inputs::inputs_dir(jan_data_folder, thread_id)?;
+        match tokio::fs::remove_dir_all(&inputs).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("ERROR: {e}")),
+        }
+    }
+    Ok(())
 }
 
 /// Delete a Cowork session's sandbox. Idempotent: a missing sandbox is Ok.
@@ -815,6 +828,45 @@ mod tests {
 
         remove_thread_workspace(&data, "t1").await.unwrap();
         assert!(!dir.exists());
+        remove_thread_workspace(&data, "t1").await.unwrap();
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A deleted conversation takes its python inputs with it, and only its own.
+    #[cfg(feature = "python-tool")]
+    #[tokio::test]
+    async fn removing_a_thread_also_removes_its_python_inputs() {
+        use crate::python::inputs::inputs_dir;
+        let data = unique_data_folder();
+        ensure_thread_workspace(&data, "t1").await.unwrap();
+        let mine = inputs_dir(&data, "t1").unwrap();
+        let theirs = inputs_dir(&data, "t2").unwrap();
+        for dir in [&mine, &theirs] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("data.csv"), "a,b").unwrap();
+        }
+
+        remove_thread_workspace(&data, "t1").await.unwrap();
+        assert!(!thread_workspace(&data, "t1").unwrap().exists());
+        assert!(!mine.exists(), "the thread's inputs must go with it");
+        assert!(
+            theirs.join("data.csv").is_file(),
+            "another thread's inputs stay"
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Inputs can outlive the workspace (a run that staged files, then a crash),
+    /// and a thread that never ran python has none: neither is an error.
+    #[cfg(feature = "python-tool")]
+    #[tokio::test]
+    async fn removing_python_inputs_does_not_need_the_workspace_or_the_inputs() {
+        use crate::python::inputs::inputs_dir;
+        let data = unique_data_folder();
+        let inputs = inputs_dir(&data, "t1").unwrap();
+        std::fs::create_dir_all(&inputs).unwrap();
+        remove_thread_workspace(&data, "t1").await.unwrap();
+        assert!(!inputs.exists());
         remove_thread_workspace(&data, "t1").await.unwrap();
         let _ = std::fs::remove_dir_all(&data);
     }

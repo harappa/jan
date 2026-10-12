@@ -32,6 +32,10 @@ const COMMANDS: &[&str] = &[
     "cancel_thread_bash",
     "preview_register_root",
     "preview_unregister_root",
+    "python_status",
+    "python_run",
+    "python_cancel",
+    "python_save_file",
 ];
 
 fn main() {
