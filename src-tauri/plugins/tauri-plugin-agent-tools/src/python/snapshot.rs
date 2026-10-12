@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Relative path (always `/`-separated) -> (size in bytes, modified time).
@@ -21,46 +21,56 @@ pub struct ChangedFile {
 /// Record the size and modified time of every file under `dir` (hidden files
 /// included). Symlinks and junctions are skipped, not followed, so the walk can
 /// neither leave `dir` nor loop. Only directory listings are read (no file
-/// contents), so this stays cheap on large folders. A file or folder that
-/// vanishes while the walk runs is left out.
+/// contents), so this stays cheap on large folders.
+///
+/// The run being compared may still be changing the folder while it is walked,
+/// so below `dir` anything that cannot be read (removed, replaced, locked,
+/// delete-pending, permission changed) is left out of the snapshot instead of
+/// failing it. Only an error reading `dir` itself is returned.
 pub fn snapshot(dir: &Path) -> std::io::Result<Snapshot> {
+    walk(dir, &mut |_| {})
+}
+
+/// `snapshot`, calling `before_read_dir` with each subfolder just before it is
+/// listed (a seam for tests to change the folder at that exact point).
+fn walk(dir: &Path, before_read_dir: &mut dyn FnMut(&Path)) -> std::io::Result<Snapshot> {
     let mut out = Snapshot::new();
+    let mut pending = Vec::new();
     // The root must be readable; a problem there is the caller's to see.
-    let mut pending = vec![(dir.to_path_buf(), String::new())];
-    let mut is_root = true;
+    scan_dir(dir, "", &mut pending, &mut out)?;
     while let Some((path, prefix)) = pending.pop() {
-        let entries = match std::fs::read_dir(&path) {
-            Ok(entries) => entries,
-            Err(e) if !is_root && e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        is_root = false;
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
-            };
-            let meta = match entry.metadata() {
-                Ok(meta) => meta,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
-            };
-            let file_type = meta.file_type();
-            if file_type.is_symlink() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let rel = format!("{prefix}{name}");
-            if file_type.is_dir() {
-                pending.push((entry.path(), format!("{rel}/")));
-            } else if file_type.is_file() {
-                let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                out.insert(rel, (meta.len(), modified));
-            }
-        }
+        before_read_dir(&path);
+        // Best effort: an unreadable subfolder is simply absent.
+        let _ = scan_dir(&path, &prefix, &mut pending, &mut out);
     }
     Ok(out)
+}
+
+/// List one folder: files go into `out`, subfolders onto `pending`. Entries
+/// whose own read fails are skipped; only failing to open the listing is an error.
+fn scan_dir(
+    path: &Path,
+    prefix: &str,
+    pending: &mut Vec<(PathBuf, String)>,
+    out: &mut Snapshot,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(path)? {
+        let Ok(entry) = entry else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = format!("{prefix}{name}");
+        if file_type.is_dir() {
+            pending.push((entry.path(), format!("{rel}/")));
+        } else if file_type.is_file() {
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            out.insert(rel, (meta.len(), modified));
+        }
+    }
+    Ok(())
 }
 
 /// Files in `after` that are not in `before`, or whose size or modified time
@@ -284,6 +294,61 @@ mod tests {
         assert!(snap.keys().all(|k| !k.starts_with("link/")));
         assert!(snap.keys().all(|k| !k.starts_with("loop/")));
         assert!(snap.contains_key("real.txt"));
+    }
+
+    #[test]
+    fn subfolder_removed_after_it_was_listed_is_left_out() {
+        let s = Scratch::new();
+        s.write("keep.txt", "1");
+        s.write("victim/inner.txt", "22");
+        s.write("other/ok.txt", "333");
+        let snap = walk(s.path(), &mut |dir| {
+            if dir.file_name().is_some_and(|n| n == "victim") {
+                fs::remove_dir_all(dir).unwrap();
+            }
+        })
+        .unwrap();
+        let keys: Vec<&str> = snap.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["keep.txt", "other/ok.txt"]);
+    }
+
+    #[test]
+    fn subfolder_replaced_by_a_file_after_it_was_listed_is_left_out() {
+        let s = Scratch::new();
+        s.write("victim/inner.txt", "22");
+        s.write("other/ok.txt", "333");
+        let snap = walk(s.path(), &mut |dir| {
+            if dir.file_name().is_some_and(|n| n == "victim") {
+                fs::remove_dir_all(dir).unwrap();
+                fs::write(dir, "now a file").unwrap();
+            }
+        })
+        .unwrap();
+        let keys: Vec<&str> = snap.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["other/ok.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subfolder_is_left_out_instead_of_failing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let s = Scratch::new();
+        s.write("keep.txt", "1");
+        s.write("locked/inner.txt", "22");
+        s.write("locked/deeper/x.txt", "3");
+        let locked = s.path().join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root (and anyone with CAP_DAC_OVERRIDE) can still list it: nothing to check.
+        let can_list = fs::read_dir(&locked).is_ok();
+        let result = snapshot(s.path());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        if can_list {
+            return;
+        }
+        let snap = result.unwrap();
+        let keys: Vec<&str> = snap.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["keep.txt"]);
     }
 
     #[test]
