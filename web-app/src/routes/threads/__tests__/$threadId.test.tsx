@@ -88,9 +88,14 @@ const h = vi.hoisted(() => {
   const useModelProviderMock: any = (selector: any) => selector(modelProviderState)
   useModelProviderMock.getState = () => modelProviderState
 
+  // One session data object per thread, like the real store: consecutive
+  // turns and loops of a thread share it.
+  const sessionDataByThread: Record<string, any> = {}
+  const sessionDataFor = (id: string) =>
+    (sessionDataByThread[id] ??= { tools: [] })
   const chatSessionsState: any = {
     sessions: {},
-    getSessionData: vi.fn(() => ({ tools: [] })),
+    getSessionData: vi.fn(sessionDataFor),
   }
   const useChatSessionsMock: any = (selector: any) => selector(chatSessionsState)
   useChatSessionsMock.getState = () => chatSessionsState
@@ -143,6 +148,9 @@ const h = vi.hoisted(() => {
   useMessageQueueMock.getState = () => messageQueueState
 
   return {
+    routeThreadId: 'thread-1',
+    sessionDataByThread,
+    sessionDataFor,
     mockSendMessage,
     mockRegenerate,
     mockStop,
@@ -184,7 +192,7 @@ const h = vi.hoisted(() => {
 
 vi.mock('@tanstack/react-router', () => ({
   createFileRoute: () => (config: any) => ({ ...config, id: '/threads/$threadId' }),
-  useParams: () => ({ threadId: 'thread-1' }),
+  useParams: () => ({ threadId: h.routeThreadId }),
   useSearch: () => ({ threadModel: undefined }),
 }))
 
@@ -447,6 +455,7 @@ vi.mock('@/utils/error', async (importOriginal) => ({
 import { Route } from '../$threadId'
 import { getServiceHub } from '@/hooks/useServiceHub'
 import { useToolCallRuntime } from '@/hooks/useToolCallRuntime'
+import { useToolLoops } from '@/stores/tool-loop-store'
 import { useMessageErrors } from '@/stores/message-errors'
 import {
   processAttachmentsForSend,
@@ -496,12 +505,18 @@ describe('ThreadDetail route', () => {
     h.messagesState.updateMessage = vi.fn()
     h.messagesState.deleteMessage = vi.fn()
     h.messagesState.setMessages = vi.fn()
-    h.chatSessionsState.getSessionData = vi.fn(() => ({ tools: [] }))
+    h.routeThreadId = 'thread-1'
+    for (const id of Object.keys(h.sessionDataByThread)) {
+      delete h.sessionDataByThread[id]
+    }
+    h.chatSessionsState.getSessionData = vi.fn(h.sessionDataFor)
+    useToolLoops.setState({ running: {} })
     h.messageQueueState.dequeue = vi.fn(() => null)
     h.messageQueueState.clearQueue = vi.fn()
     h.agentModeState.agentThreads = {}
     h.modelProviderState.selectedProvider = 'openai'
     h.appStateState.oomError = undefined
+    h.appStateState.backendError = undefined
     h.appStateState.ragToolNames = new Set<string>()
     h.appStateState.mcpToolNames = new Set<string>()
     h.appStateState.tools = []
@@ -1307,6 +1322,20 @@ describe('ThreadDetail route', () => {
         return { started, releases }
       }
 
+      // Every call hangs until the test releases it.
+      const hangingAll = () => {
+        const started: string[] = []
+        const releases: Record<string, () => void> = {}
+        const callTool = vi.fn(({ arguments: args }: any) => {
+          started.push(args.id)
+          return new Promise((resolve) => {
+            releases[args.id] = () => resolve({ error: '', content: [] })
+          })
+        })
+        hub.mcp = () => ({ callTool }) as never
+        return { started, releases }
+      }
+
       const arriveWithIds = async (...ids: string[]) => {
         for (const id of ids) {
           await act(async () => {
@@ -1410,18 +1439,6 @@ describe('ThreadDetail route', () => {
       // The user stops loop A, sends again and loop B starts while A's tool
       // has not returned yet. A must not tear down what B now owns.
       describe('a stopped loop whose tool returns after the next loop started', () => {
-        const hangingAll = () => {
-          const started: string[] = []
-          const releases: Record<string, () => void> = {}
-          const callTool = vi.fn(({ arguments: args }: any) => {
-            started.push(args.id)
-            return new Promise((resolve) => {
-              releases[args.id] = () => resolve({ error: '', content: [] })
-            })
-          })
-          hub.mcp = () => ({ callTool }) as never
-          return { started, releases }
-        }
         const busyFalseCalls = () =>
           h.appStateState.setThreadBusy.mock.calls.filter(
             (c: any[]) => c[0] === 'thread-1' && c[1] === false
@@ -1514,6 +1531,188 @@ describe('ThreadDetail route', () => {
         })
       })
 
+      // The thread's session data is shared by its consecutive turns, so a
+      // stopped loop and the next turn meet in the same object.
+      describe('consecutive turns on one thread', () => {
+        const addedIds = () =>
+          h.mockAddToolOutput.mock.calls.map((c: any[]) => c[0].toolCallId)
+
+        it('a turn after a stop runs only its own calls, never the stopped one', async () => {
+          h.appStateState.mcpToolNames = new Set(['fetch'])
+          h.lastAssistantComplete.mockImplementation(() => true)
+          const { started, releases } = hangingAll()
+          const followUps: Array<[string, boolean]> = []
+          h.mockAddToolOutput.mockImplementation((o: any) => {
+            followUps.push([
+              o.toolCallId,
+              (h as any).capturedSendAutomaticallyWhen({ messages: [] }),
+            ])
+          })
+          renderComponent()
+          await arriveWithIds('tcA')
+          await act(async () => {
+            await finishWithToolCalls()
+          })
+          await act(async () => {
+            screen.getByTestId('chat-stop').click()
+          })
+
+          // Turn B arrives and finishes while A's tool is still in flight.
+          await arriveWithIds('tcC')
+          await act(async () => {
+            await finishWithToolCalls()
+          })
+          await act(async () => {
+            releases.tcA()
+          })
+          await act(async () => {
+            releases.tcC?.()
+          })
+
+          expect(started).toEqual(['tcA', 'tcC'])
+          expect(addedIds().filter((id: string) => id === 'tcA').length).toBe(1)
+          expect(followUps).toContainEqual(['tcC', true])
+          expect(toolsRunningFlag()).toBe('false')
+          expect(h.appStateState.setThreadBusy).toHaveBeenLastCalledWith(
+            'thread-1',
+            false
+          )
+        })
+
+        it("a stopped tool that returns while the next turn streams leaves that turn's calls alone", async () => {
+          h.appStateState.mcpToolNames = new Set(['fetch'])
+          const { started, releases } = hangingAll()
+          renderComponent()
+          await arriveWithIds('tcA')
+          await act(async () => {
+            await finishWithToolCalls()
+          })
+          await act(async () => {
+            screen.getByTestId('chat-stop').click()
+          })
+
+          // B is streaming: its call has arrived, its finish has not.
+          await arriveWithIds('tcC')
+          await act(async () => {
+            releases.tcA()
+          })
+          await act(async () => {
+            await finishWithToolCalls()
+          })
+          expect(started).toEqual(['tcA', 'tcC'])
+          expect(toolsRunningFlag()).toBe('true')
+
+          await act(async () => {
+            releases.tcC()
+          })
+          expect(addedIds()).toContain('tcC')
+          expect(toolsRunningFlag()).toBe('false')
+        })
+      })
+
+      // The route component is reused across threads; each thread keeps its
+      // own loop state.
+      it('a thread left mid-loop keeps nothing that blocks or reruns on return', async () => {
+        h.appStateState.mcpToolNames = new Set(['fetch'])
+        h.threadsState.threads['thread-2'] = {
+          id: 'thread-2',
+          title: 'Other',
+          metadata: {},
+          assistants: [],
+          model: { id: 'gpt-x', provider: 'openai' },
+        }
+        const { started, releases } = hangingAll()
+        const Component = Route.component as React.ComponentType
+        const { rerender } = render(<Component />)
+        await arriveWithIds('tcA')
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+        expect(started).toEqual(['tcA'])
+
+        // Thread Y starts its own loop; X's stopped tool returns meanwhile.
+        h.routeThreadId = 'thread-2'
+        await act(async () => {
+          rerender(<Component />)
+        })
+        await arriveWithIds('tcY')
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+        expect(started).toEqual(['tcA', 'tcY'])
+        await act(async () => {
+          releases.tcA()
+        })
+
+        h.messageQueueState.dequeue.mockClear()
+        h.routeThreadId = 'thread-1'
+        await act(async () => {
+          rerender(<Component />)
+        })
+        expect(h.sessionDataByThread['thread-1'].tools).toEqual([])
+        expect(toolsRunningFlag()).toBe('false')
+        expect(h.messageQueueState.dequeue).toHaveBeenCalledWith('thread-1')
+
+        // X's next turn runs its own call only.
+        await arriveWithIds('tcX')
+        await act(async () => {
+          await finishWithToolCalls()
+        })
+        expect(started).toEqual(['tcA', 'tcY', 'tcX'])
+        await act(async () => {
+          releases.tcX?.()
+          releases.tcY?.()
+        })
+        delete h.threadsState.threads['thread-2']
+      })
+
+      // The Chat keeps the callbacks of the render that created it, also after
+      // the route unmounts and mounts again (settings and back).
+      it("a remounted route shows and stops a loop run by the first mount's callbacks", async () => {
+        h.appStateState.mcpToolNames = new Set(['fetch'])
+        h.lastAssistantComplete.mockImplementation(() => true)
+        const { started, releases } = hangingAll()
+        const first = renderComponent()
+        const chat = {
+          onToolCall: (h as any).capturedOnToolCall,
+          onFinish: (h as any).capturedOnFinish,
+          sendWhen: (h as any).capturedSendAutomaticallyWhen,
+        }
+        first.unmount()
+        renderComponent()
+
+        await act(async () => {
+          for (const id of ['tcA', 'tcB']) {
+            await chat.onToolCall({
+              toolCall: { toolCallId: id, toolName: 'fetch', input: { id } },
+            })
+          }
+        })
+        await act(async () => {
+          await chat.onFinish({
+            message: {
+              id: 'a-tc',
+              role: 'assistant',
+              parts: [{ type: 'text', text: '' }],
+              metadata: { finishReason: 'tool-calls' },
+            },
+            isAbort: false,
+          })
+        })
+        expect(started).toEqual(['tcA'])
+        expect(toolsRunningFlag()).toBe('true')
+
+        await act(async () => {
+          screen.getByTestId('chat-stop').click()
+        })
+        expect(toolsRunningFlag()).toBe('false')
+        expect(chat.sendWhen({ messages: [] })).toBe(false)
+        await act(async () => {
+          releases.tcA()
+        })
+        expect(started).toEqual(['tcA'])
+      })
+
       // The real approval store, so that releasing an approval is exercised
       // end to end: the dialog entry goes away and the awaiting loop unblocks.
       describe('with the real approval store', () => {
@@ -1547,12 +1746,12 @@ describe('ThreadDetail route', () => {
           hub.mcp = () => ({ callTool: fn }) as never
           return fn
         }
-        const finishAborted = () =>
+        const finishAborted = (toolParts: unknown[] = []) =>
           (h as any).capturedOnFinish({
             message: {
               id: 'a-tc',
               role: 'assistant',
-              parts: [{ type: 'text', text: 'partial' }],
+              parts: [{ type: 'text', text: 'partial' }, ...toolParts],
               metadata: { finishReason: 'tool-calls' },
             },
             isAbort: true,
@@ -1604,22 +1803,40 @@ describe('ThreadDetail route', () => {
           expect(h.mockStop).toHaveBeenCalledTimes(1)
           expect(actualStore.getState().pending).toEqual({})
 
-          // The SDK then reports the aborted stream.
+          // The SDK then reports the aborted stream; its message carries the
+          // call the stop dropped from the collected list.
           await act(async () => {
-            await finishAborted()
+            await finishAborted([
+              {
+                type: 'tool-fetch',
+                toolCallId: 'tcP',
+                state: 'input-available',
+                input: { id: 'tcP' },
+              },
+            ])
           })
           expect(call).not.toHaveBeenCalled()
-          expect(h.mockAddToolOutput).not.toHaveBeenCalled()
+          expect(h.mockAddToolOutput.mock.calls).toEqual([
+            [
+              {
+                state: 'output-error',
+                tool: 'fetch',
+                toolCallId: 'tcP',
+                errorText: 'Tool execution denied by user',
+              },
+            ],
+          ])
           // No second dialog was opened for the stopped turn.
           expect(actualStore.getState().pending).toEqual({})
           expect(toolsRunningFlag()).toBe('false')
-          expect(h.appStateState.setThreadBusy).toHaveBeenLastCalledWith(
+          // No loop, so the thread was never marked busy for tools.
+          expect(h.appStateState.setThreadBusy).not.toHaveBeenCalledWith(
             'thread-1',
-            false
+            true
           )
         })
 
-        it('an aborted finish does not run the tool calls it collected', async () => {
+        it('an aborted finish runs none of its calls and gives them the denied result', async () => {
           h.appStateState.mcpToolNames = new Set(['fetch'])
           const call = callTool()
           renderComponent()
@@ -1628,8 +1845,43 @@ describe('ThreadDetail route', () => {
             await finishAborted()
           })
           expect(call).not.toHaveBeenCalled()
-          expect(h.mockAddToolOutput).not.toHaveBeenCalled()
+          // The same result a call gets when its approval is denied, so the
+          // card does not keep showing the call as running.
+          expect(h.mockAddToolOutput.mock.calls).toEqual([
+            [
+              {
+                state: 'output-error',
+                tool: 'fetch',
+                toolCallId: 'tcP',
+                errorText: 'Tool execution denied by user',
+              },
+            ],
+          ])
+          expect(actualStore.getState().pending).toEqual({})
+          expect(h.sessionDataByThread['thread-1'].tools).toEqual([])
           expect(toolsRunningFlag()).toBe('false')
+        })
+
+        it('the router error stop also releases the approvals of the thread', async () => {
+          h.appStateState.mcpToolNames = new Set(['fetch'])
+          h.modelProviderState.selectedProvider = 'llamacpp'
+          // 'submitted' rather than 'streaming', which would also fetch the
+          // llamacpp context size through the extension manager.
+          h.chatState.status = 'submitted'
+          const call = callTool()
+          const Component = Route.component as React.ComponentType
+          const { rerender } = render(<Component />)
+          await arriveWithIds('tcP')
+          expect(Object.keys(actualStore.getState().pending)).toEqual(['tcP'])
+
+          h.appStateState.backendError = 'router crashed'
+          await act(async () => {
+            rerender(<Component />)
+          })
+          expect(h.mockStop).toHaveBeenCalled()
+          expect(actualStore.getState().pending).toEqual({})
+          expect(h.sessionDataByThread['thread-1'].tools).toEqual([])
+          expect(call).not.toHaveBeenCalled()
         })
       })
 

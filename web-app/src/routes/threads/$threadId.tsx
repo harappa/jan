@@ -100,6 +100,14 @@ import { ExtensionTypeEnum, VectorDBExtension } from '@janhq/core'
 import { ExtensionManager } from '@/lib/extension'
 import { Shimmer } from '@/components/ai-elements/shimmer'
 import { useMessageQueue } from '@/stores/message-queue-store'
+import {
+  endToolLoop,
+  releaseToolApprovals,
+  startToolLoop,
+  stopToolLoop,
+  toolApprovalsFor,
+  useToolLoops,
+} from '@/stores/tool-loop-store'
 import { generateThreadTitle } from '@/lib/thread-title-summarizer'
 import { useAutoScroll } from '@/hooks/useAutoScroll'
 import {
@@ -130,6 +138,39 @@ function isAutoAllowedTool(toolName: string): boolean {
     WEB_TOOL_NAMES.has(toolName) ||
     CHAT_AGENT_TOOL_NAMES.has(toolName)
   )
+}
+
+// The result of a call that was not approved, also given to the calls of a
+// stopped turn so their cards do not keep showing them as running.
+function deniedToolOutput(toolCall: { toolName: string; toolCallId: string }) {
+  return {
+    state: 'output-error' as const,
+    tool: toolCall.toolName,
+    toolCallId: toolCall.toolCallId,
+    errorText: 'Tool execution denied by user',
+  }
+}
+
+// The calls of a stopped turn that never got a result: those still collected,
+// and those in the message (a stop during streaming has already dropped the
+// collected list, but the message still carries the calls).
+function unfinishedToolCalls(
+  message: UIMessage,
+  collected: Array<{ toolName: string; toolCallId: string }>
+) {
+  const calls = new Map(collected.map((tc) => [tc.toolCallId, tc]))
+  for (const part of message.parts) {
+    if (!('toolCallId' in part) || part.state !== 'input-available') continue
+    if (calls.has(part.toolCallId)) continue
+    calls.set(part.toolCallId, {
+      toolName:
+        part.type === 'dynamic-tool'
+          ? part.toolName
+          : part.type.slice('tool-'.length),
+      toolCallId: part.toolCallId,
+    })
+  }
+  return [...calls.values()]
 }
 
 // Persist the out-of-context error onto the latest user message so the banner
@@ -201,38 +242,28 @@ function ThreadDetail() {
   const getSessionData = useChatSessions((state) => state.getSessionData)
   const sessionData = getSessionData(threadId)
 
-  // AbortController for cancelling tool calls
-  const toolCallAbortController = useRef<AbortController | null>(null)
-  // True from the start of the tool loop to its end. The loop runs in onFinish,
-  // after the stream ended, so the SDK status is 'ready' meanwhile; ChatInput
-  // uses this to keep the stop button available. Not derived from busyThreads,
-  // which is also set while attachments are embedded (nothing to cancel there).
-  const [toolsRunning, setToolsRunning] = useState(false)
-  // Counts tool loops started. A loop the user stopped can still be waiting on
-  // its in-flight tool when the next loop starts; once superseded it must leave
-  // the shared state (controller, flag, busy, approvals) to the newer loop.
-  const toolLoopGeneration = useRef(0)
-
-  // Approval promises started in onToolCall (so the popup appears immediately)
-  // and awaited by the onFinish execution loop, keyed by toolCallId. Executing
-  // stays in onFinish so the tool result lands on a completed assistant message
-  // and the AI SDK's auto-resubmit (sendAutomaticallyWhen) fires.
-  const toolApprovalPromises = useRef<Map<string, Promise<boolean>>>(new Map())
+  // True from the start of the thread's tool loop to its end. The loop runs in
+  // onFinish, after the stream ended, so the SDK status is 'ready' meanwhile;
+  // ChatInput uses this to keep the stop button available. Not derived from
+  // busyThreads, which is also set while attachments are embedded (nothing to
+  // cancel there). The loop itself is per thread (stores/tool-loop-store.ts),
+  // not component state: the Chat keeps the callbacks of the render that
+  // created it, also after this route remounts.
+  const toolsRunning = useToolLoops((s) => !!s.running[threadId])
 
   const titleAbortRef = useRef<AbortController | null>(null)
 
-  // Check if we should follow up with tool calls (respects abort signal)
+  // Follow up only from a live loop of this thread: not after a stop, and not
+  // for a stopped turn (which starts no loop).
   const followUpMessage = useCallback(
     ({ messages }: { messages: UIMessage[] }) => {
-      if (
-        !toolCallAbortController.current ||
-        toolCallAbortController.current?.signal.aborted
-      ) {
+      const loop = useChatSessions.getState().getSessionData(threadId).toolLoop
+      if (!loop || loop.controller.signal.aborted) {
         return false
       }
       return lastAssistantMessageIsCompleteWithToolCalls({ messages })
     },
-    []
+    [threadId]
   )
 
   // Subscribe directly to the thread data to ensure updates when model changes
@@ -527,37 +558,33 @@ function ThreadDetail() {
         }
       }
 
+      // A stopped turn runs none of its tool calls. They get the result of a
+      // denied call instead, so no card keeps showing them as running, and no
+      // loop starts, so nothing asks the model for a follow-up.
+      if (isAbort) {
+        const collected = sessionData.tools
+        sessionData.tools = []
+        releaseToolApprovals(threadId)
+        for (const toolCall of unfinishedToolCalls(message, collected)) {
+          addToolOutput(deniedToolOutput(toolCall))
+        }
+        return
+      }
+
       // Execute tool calls here, after the assistant message has completed, so
       // each addToolOutput lands on a finished message and the SDK's
       // auto-resubmit (sendAutomaticallyWhen) fires. Approval is requested
       // earlier in onToolCall (popup appears without waiting for this callback);
       // we await that already-started promise here rather than prompting again.
-      // A stopped turn must not run its tool calls (the stop handler already
-      // released their approvals); the calls are left without a result and the
-      // transport marks them as errored when the history is sent again.
-      const toolsToRun = isAbort ? [] : sessionData.tools
-      const loopController = new AbortController()
-      toolCallAbortController.current = loopController
-      const signal = loopController.signal
-      const generation = ++toolLoopGeneration.current
-      setToolsRunning(true)
-
-      const finishToolLoop = () => {
-        if (toolLoopGeneration.current !== generation) return
-        useToolCallRuntime.getState().settleRemaining()
-        sessionData.tools = []
-        toolApprovalPromises.current.clear()
-        setToolsRunning(false)
-        toolCallAbortController.current = null
-        useAppState.getState().setThreadBusy(threadId, false)
-      }
+      // The loop takes the collected calls over, so the calls of a later turn
+      // never mix with them, even when this loop is stopped and still waiting
+      // on its tool when that turn arrives.
+      const { loop, toolCalls: toolsToRun } = startToolLoop(threadId)
+      const signal = loop.controller.signal
+      const approvals = toolApprovalsFor(threadId)
 
       const ragToolNames = useAppState.getState().ragToolNames
       const mcpToolNames = useAppState.getState().mcpToolNames
-
-      // Keep the thread marked busy while awaiting approval and executing tools,
-      // since streaming has already ended and isSessionBusy's tools-array read isn't reactive.
-      useAppState.getState().setThreadBusy(threadId, true)
 
       // Tools run one at a time below, so the rest are genuinely queued.
       useToolCallRuntime
@@ -575,7 +602,7 @@ function ThreadDetail() {
 
             const approved = isAutoAllowedTool(toolName)
               ? true
-              : await (toolApprovalPromises.current.get(toolCall.toolCallId) ??
+              : await (approvals.get(toolCall.toolCallId) ??
                   useToolApprovalRequests
                     .getState()
                     .requestApproval(
@@ -584,15 +611,10 @@ function ThreadDetail() {
                       threadId,
                       serverForTool(toolName)
                     ))
-            toolApprovalPromises.current.delete(toolCall.toolCallId)
+            approvals.delete(toolCall.toolCallId)
 
             if (!approved) {
-              addToolOutput({
-                state: 'output-error',
-                tool: toolCall.toolName,
-                toolCallId: toolCall.toolCallId,
-                errorText: 'Tool execution denied by user',
-              })
+              addToolOutput(deniedToolOutput(toolCall))
               continue
             }
 
@@ -680,12 +702,12 @@ function ThreadDetail() {
           }
         }
 
-        finishToolLoop()
+        endToolLoop(threadId, loop)
       })().catch((error) => {
         if (error.name !== 'AbortError') {
           console.error('Tool call error:', error)
         }
-        finishToolLoop()
+        endToolLoop(threadId, loop)
       })
 
       if (!isAbort) {
@@ -762,11 +784,12 @@ function ThreadDetail() {
       // onFinish so the tool result lands on a completed message. Internal tools
       // never prompt (see isAutoAllowedTool).
       sessionData.tools.push(toolCall)
+      const approvals = toolApprovalsFor(threadId)
       if (
         !isAutoAllowedTool(toolCall.toolName) &&
-        !toolApprovalPromises.current.has(toolCall.toolCallId)
+        !approvals.has(toolCall.toolCallId)
       ) {
-        toolApprovalPromises.current.set(
+        approvals.set(
           toolCall.toolCallId,
           useToolApprovalRequests
             .getState()
@@ -789,23 +812,12 @@ function ThreadDetail() {
   const hasBannerError = !!(oomError || backendError || contextLimitError)
   const effectiveStatus = hasBannerError ? 'ready' : status
 
-  // The SDK's stop() only ends the stream. While the tool loop runs, also abort
-  // it (an aborted controller keeps followUpMessage from resubmitting) and
-  // release approvals waiting on this thread, as the thread-switch cleanup does.
+  // The SDK's stop() only ends the stream. Also stop the thread's tool loop and
+  // release its approvals: while streaming, a dialog opened by onToolCall would
+  // otherwise stay open for a turn that is over.
   const handleStop = useCallback(() => {
     stop()
-    // Also while streaming: a dialog opened by onToolCall would otherwise keep
-    // the loop that starts at the end of the stream waiting on it.
-    toolApprovalPromises.current.clear()
-    useToolApprovalRequests.getState().clearPendingForThread(threadId)
-    const controller = toolCallAbortController.current
-    if (controller) {
-      controller.abort()
-      // Settle the queue of the loop being stopped now: once a newer loop has
-      // started, this one no longer touches the shared runtime state.
-      useToolCallRuntime.getState().settleRemaining()
-      setToolsRunning(false)
-    }
+    stopToolLoop(threadId)
   }, [stop, threadId])
 
   // Global disabled-tools set; re-run the effect below when it changes.
@@ -1018,19 +1030,8 @@ function ThreadDetail() {
   // are leaving. Cleanup captures the previous threadId; without this the
   // unresolved approval promise keeps that thread marked busy forever.
   useEffect(() => {
-    // Stable ref object (never reassigned) — capture for the cleanup closure.
-    const approvalPromises = toolApprovalPromises.current
     return () => {
-      // The loop's own cleanup is skipped once a loop on another thread has
-      // superseded it, so release the busy mark of the thread we leave here.
-      if (toolCallAbortController.current) {
-        useAppState.getState().setThreadBusy(threadId, false)
-      }
-      toolCallAbortController.current?.abort()
-      toolCallAbortController.current = null
-      setToolsRunning(false)
-      approvalPromises.clear()
-      useToolApprovalRequests.getState().clearPendingForThread(threadId)
+      stopToolLoop(threadId)
       // Drop per-thread timing/progress/diff state from the shared runtime
       // store. The cards for the thread we leave are unmounting, so a thread a
       // later visit cannot show another thread's diff. (code.tsx re-hydrates
@@ -1740,8 +1741,10 @@ function ThreadDetail() {
       } catch (e) {
         console.warn('router error stop() threw:', e)
       }
+      // Release approvals opened by onToolCall for the turn being stopped.
+      stopToolLoop(threadId)
     }
-  }, [oomError, backendError, contextLimitError, status, stop])
+  }, [oomError, backendError, contextLimitError, status, stop, threadId])
 
   useEffect(() => {
     if (status === 'streaming' && pendingContinuationRef.current) {
@@ -1761,7 +1764,7 @@ function ThreadDetail() {
 
   useEffect(() => {
     if (status !== 'ready' || processingQueueRef.current) return
-    if (sessionData.tools.length > 0) return
+    if (toolsRunning || sessionData.tools.length > 0) return
 
     const next = useMessageQueue.getState().dequeue(threadId)
     if (!next) return
@@ -1774,7 +1777,13 @@ function ThreadDetail() {
       .finally(() => {
         processingQueueRef.current = false
       })
-  }, [status, threadId, sendQueuedMessage, sessionData.tools.length])
+  }, [
+    status,
+    threadId,
+    sendQueuedMessage,
+    toolsRunning,
+    sessionData.tools.length,
+  ])
 
   // If streaming errors out, discard any queued messages so they don't sit there stuck
   useEffect(() => {

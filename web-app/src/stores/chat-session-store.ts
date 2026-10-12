@@ -5,10 +5,23 @@ import type { ChatStatus } from "ai";
 import { CustomChatTransport } from "@/lib/custom-chat-transport";
 import { useMessageQueue } from "@/stores/message-queue-store";
 
+/** A tool loop run for a thread after its stream finished. */
+export type ToolLoop = {
+  controller: AbortController;
+  /** The calls this loop took over, to settle only its own on exit. */
+  toolCallIds: string[];
+};
+
 export type SessionData = {
   tools: any[];
   messages: UIMessage[];
   idMap: Map<string, string>;
+  // Kept per thread rather than in the chat route: the Chat keeps the
+  // callbacks of the render that created it, also after the route remounts.
+  /** The thread's running tool loop; see stores/tool-loop-store.ts. */
+  toolLoop?: ToolLoop;
+  /** Approval prompts started in onToolCall and awaited by the loop, by toolCallId. */
+  toolApprovals?: Map<string, Promise<boolean>>;
 };
 
 export type ChatSession = {
