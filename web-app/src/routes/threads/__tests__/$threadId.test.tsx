@@ -177,7 +177,7 @@ const h = vi.hoisted(() => {
 
 vi.mock('@tanstack/react-router', () => ({
   createFileRoute: () => (config: any) => ({ ...config, id: '/threads/$threadId' }),
-  useParams: () => ({ threadId: 'thread-1' }),
+  useParams: () => ({ threadId: py.routeThreadId }),
   useSearch: () => ({ threadModel: undefined }),
 }))
 
@@ -323,11 +323,14 @@ vi.mock('@/lib/completion', () => ({
 const py = vi.hoisted(() => ({
   executePython: vi.fn(),
   collectPythonAttachments: vi.fn(),
+  getPythonStatus: vi.fn(),
+  routeThreadId: 'thread-1',
 }))
 
 vi.mock('@/lib/pythonTool', () => ({
   PYTHON_TOOL_NAME: 'python',
   executePython: py.executePython,
+  getPythonStatus: py.getPythonStatus,
 }))
 
 vi.mock('@/lib/pythonAttachments', () => ({
@@ -493,6 +496,9 @@ describe('ThreadDetail route', () => {
       content: 'ok\n[exit 0]',
       isError: false,
     })
+    py.getPythonStatus.mockReset()
+    py.getPythonStatus.mockResolvedValue({ available: true })
+    py.routeThreadId = 'thread-1'
     py.collectPythonAttachments.mockReset()
     py.collectPythonAttachments.mockResolvedValue([])
     useToolCallRuntime.getState().reset()
@@ -1283,6 +1289,76 @@ describe('ThreadDetail route', () => {
         expect(call.toolCallId).toBe('py6')
         expect(call.output).toMatch(/^ERROR: /)
         expect(call).not.toHaveProperty('errorText')
+      })
+
+      it('uses the id of the thread the route shows', async () => {
+        py.routeThreadId = 'thread-2'
+        h.threadsState.threads['thread-2'] = {
+          ...h.threadsState.threads['thread-1'],
+          id: 'thread-2',
+        }
+
+        await run('py9', { code: 'print(1)' })
+
+        expect(py.collectPythonAttachments).toHaveBeenCalledWith(
+          'thread-2',
+          expect.anything()
+        )
+        expect(py.executePython.mock.calls[0][0]).toBe('thread-2')
+      })
+
+      // The transport offers the built-in only when python is available; then
+      // a tool named python belongs to someone else (an MCP server) and must
+      // not skip approval or be routed to the sandbox.
+      describe('when python is unavailable', () => {
+        beforeEach(() => {
+          py.getPythonStatus.mockResolvedValue({ available: false })
+          h.appStateState.mcpToolNames = new Set(['python'])
+        })
+
+        it('asks for approval like any other tool', async () => {
+          await run('py10', { code: 'print(1)' })
+
+          expect(h.toolApprovalState.requestApproval).toHaveBeenCalledWith(
+            'py10',
+            'python',
+            'thread-1',
+            undefined
+          )
+        })
+
+        it('routes the call to the MCP tool, not the sandbox', async () => {
+          const callTool = vi.fn().mockResolvedValue({ error: '', content: [] })
+          hub.mcp = () => ({ callTool }) as never
+
+          await run('py11', { code: 'print(1)' })
+
+          expect(callTool).toHaveBeenCalledWith(
+            expect.objectContaining({
+              toolName: 'python',
+              arguments: { code: 'print(1)' },
+            })
+          )
+          expect(py.executePython).not.toHaveBeenCalled()
+          expect(py.collectPythonAttachments).not.toHaveBeenCalled()
+        })
+
+        it('does not run it when the approval is denied', async () => {
+          h.toolApprovalState.requestApproval = vi.fn().mockResolvedValue(false)
+          const callTool = vi.fn().mockResolvedValue({ error: '', content: [] })
+          hub.mcp = () => ({ callTool }) as never
+
+          await run('py12', { code: 'print(1)' })
+
+          expect(callTool).not.toHaveBeenCalled()
+          expect(py.executePython).not.toHaveBeenCalled()
+          expect(h.mockAddToolOutput).toHaveBeenCalledWith(
+            expect.objectContaining({
+              toolCallId: 'py12',
+              state: 'output-error',
+            })
+          )
+        })
       })
 
       it('answers an ERROR output when running throws', async () => {

@@ -91,7 +91,11 @@ import { useToolApprovalRequests } from '@/hooks/useToolApprovalRequests'
 import { useToolCallRuntime } from '@/hooks/useToolCallRuntime'
 import { WEB_TOOL_NAMES, executeWebTool } from '@/lib/webSearchTool'
 import { CHAT_AGENT_TOOL_NAMES, executeAgentTool } from '@/lib/agentTools'
-import { PYTHON_TOOL_NAME, executePython } from '@/lib/pythonTool'
+import {
+  PYTHON_TOOL_NAME,
+  executePython,
+  getPythonStatus,
+} from '@/lib/pythonTool'
 import { collectPythonAttachments } from '@/lib/pythonAttachments'
 import DropdownModelProvider from '@/containers/DropdownModelProvider'
 import { ExtensionTypeEnum, VectorDBExtension } from '@janhq/core'
@@ -121,16 +125,23 @@ function serverForTool(toolName: string): string | undefined {
 
 // Internal tools never prompt: RAG and the native web tools are Jan's own, and
 // the built-in shell is gated in Rust (execute_tool refuses anything needing
-// approval), so only workspace-confined calls ever reach here. The python tool
-// runs in a sandbox with no network, no access outside its own workspace and
-// read-only copies of the chat's attachments.
+// approval), so only workspace-confined calls ever reach here.
 function isAutoAllowedTool(toolName: string): boolean {
   return (
     useAppState.getState().ragToolNames.has(toolName) ||
     WEB_TOOL_NAMES.has(toolName) ||
-    CHAT_AGENT_TOOL_NAMES.has(toolName) ||
-    toolName === PYTHON_TOOL_NAME
+    CHAT_AGENT_TOOL_NAMES.has(toolName)
   )
+}
+
+// Whether a call to `toolName` is the built-in sandboxed python tool. Only when
+// the transport offered it (the python status says it is available): otherwise
+// a tool of that name is someone else's (an MCP server's), and it must take the
+// ordinary approval and route. The built-in never prompts: its sandbox has no
+// network, no access outside its own workspace and read-only copies of the
+// chat's attachments. The status is cached, so asking is cheap.
+async function isBuiltInPython(toolName: string): Promise<boolean> {
+  return toolName === PYTHON_TOOL_NAME && (await getPythonStatus()).available
 }
 
 // Runs the model's python call. The text goes back to the model whatever the
@@ -573,7 +584,8 @@ function ThreadDetail() {
           try {
             const toolName = toolCall.toolName
 
-            const approved = isAutoAllowedTool(toolName)
+            const builtInPython = await isBuiltInPython(toolName)
+            const approved = builtInPython || isAutoAllowedTool(toolName)
               ? true
               : await (toolApprovalPromises.current.get(toolCall.toolCallId) ??
                   useToolApprovalRequests
@@ -604,7 +616,7 @@ function ThreadDetail() {
 
             if (WEB_TOOL_NAMES.has(toolName)) {
               result = await executeWebTool(toolName, toolCall.input)
-            } else if (toolName === PYTHON_TOOL_NAME) {
+            } else if (builtInPython) {
               result = {
                 content: await runPythonToolCall(
                   threadId,
@@ -778,21 +790,28 @@ function ThreadDetail() {
       // onFinish so the tool result lands on a completed message. Internal tools
       // never prompt (see isAutoAllowedTool).
       sessionData.tools.push(toolCall)
-      if (
-        !isAutoAllowedTool(toolCall.toolName) &&
-        !toolApprovalPromises.current.has(toolCall.toolCallId)
-      ) {
+      if (toolApprovalPromises.current.has(toolCall.toolCallId)) return
+      const requestApproval = () =>
+        useToolApprovalRequests
+          .getState()
+          .requestApproval(
+            toolCall.toolCallId,
+            toolCall.toolName,
+            threadId,
+            serverForTool(toolCall.toolName)
+          )
+      if (toolCall.toolName === PYTHON_TOOL_NAME) {
+        // Whether this is the built-in or someone else's tool of that name is
+        // only known once the status is read. The promise is stored now, so the
+        // execution loop finds it rather than asking a second time.
         toolApprovalPromises.current.set(
           toolCall.toolCallId,
-          useToolApprovalRequests
-            .getState()
-            .requestApproval(
-              toolCall.toolCallId,
-              toolCall.toolName,
-              threadId,
-              serverForTool(toolCall.toolName)
-            )
+          isBuiltInPython(toolCall.toolName).then((builtIn) =>
+            builtIn ? true : requestApproval()
+          )
         )
+      } else if (!isAutoAllowedTool(toolCall.toolName)) {
+        toolApprovalPromises.current.set(toolCall.toolCallId, requestApproval())
       }
     },
     sendAutomaticallyWhen: followUpMessage,
