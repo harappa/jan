@@ -38,6 +38,25 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// The interpreter path as the first word of the command line.
+///
+/// Windows: MXC hands the line to `CreateProcessW`, where a double-quoted path
+/// is one argument (a Windows path cannot contain `"`).
+#[cfg(windows)]
+fn quote_command_path(path: &Path) -> String {
+    format!("\"{}\"", path_string(path))
+}
+
+/// The interpreter path as the first word of the command line.
+///
+/// Unix: Bubblewrap and Seatbelt run the line with `sh -c`, where `$`, `` ` ``,
+/// `\` and `"` stay special inside double quotes. Single quotes make the path
+/// literal; a `'` in it is written as `'\''` (close, escaped quote, reopen).
+#[cfg(not(windows))]
+fn quote_command_path(path: &Path) -> String {
+    format!("'{}'", path_string(path).replace('\'', r"'\''"))
+}
+
 /// The sandbox request for one run: the script arrives on stdin, the workspace
 /// is the only writable place, the runtime and inputs are read-only, and there
 /// is no network and no UI.
@@ -47,7 +66,7 @@ fn path_string(path: &Path) -> String {
 pub fn build_request(spec: &RunSpec) -> ContainerRequest {
     let python = python_executable(&spec.runtime);
     // The interpreter path is quoted: the data folder may contain spaces.
-    let mut request = ContainerRequest::new(format!("\"{}\" -I -B -", path_string(&python)));
+    let mut request = ContainerRequest::new(format!("{} -I -B -", quote_command_path(&python)));
     let workspace = path_string(&spec.workspace);
     let inputs = path_string(&spec.inputs);
 
@@ -200,11 +219,58 @@ mod tests {
         let s = spec();
         let request = build_request(&s);
         let python = crate::python::runtime::python_executable(&s.runtime);
-        assert_eq!(
-            request.command,
-            format!("\"{}\" -I -B -", python.to_str().unwrap())
-        );
+        let quoted = if cfg!(windows) {
+            format!("\"{}\"", python.to_str().unwrap())
+        } else {
+            format!("'{}'", python.to_str().unwrap())
+        };
+        assert_eq!(request.command, format!("{quoted} -I -B -"));
         assert!(request.command.contains("x y"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_is_double_quoted() {
+        let path = Path::new(r"C:\Users\a b\Jan\python.exe");
+        assert_eq!(quote_command_path(path), r#""C:\Users\a b\Jan\python.exe""#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_path_is_single_quoted_with_quotes_escaped() {
+        let q = |s: &str| quote_command_path(Path::new(s));
+        assert_eq!(q("/home/u/My Jan/python3"), "'/home/u/My Jan/python3'");
+        assert_eq!(q("/u/$work/`id`/python3"), "'/u/$work/`id`/python3'");
+        assert_eq!(q(r#"/u/My "Jan"/python3"#), r#"'/u/My "Jan"/python3'"#);
+        assert_eq!(q(r"/u/a\b/python3"), r"'/u/a\b/python3'");
+        assert_eq!(q("/u/it's/python3"), r"'/u/it'\''s/python3'");
+    }
+
+    /// The shell turns the quoted text back into exactly the original path.
+    #[cfg(unix)]
+    #[test]
+    fn unix_quoting_round_trips_through_sh() {
+        let paths = [
+            "/home/u/My Jan/python3",
+            "/u/$work/python3",
+            "/u/$(echo hi)/python3",
+            "/u/`echo hi`/python3",
+            r#"/u/My "Jan"/python3"#,
+            r"/u/a\b\n/python3",
+            "/u/it's/python3",
+            "/u/'''/python3",
+            "/u/a;b&c|d>e/python3",
+        ];
+        for original in paths {
+            let line = format!("printf %s {}", quote_command_path(Path::new(original)));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&line)
+                .output()
+                .expect("sh");
+            assert!(out.status.success(), "{line}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), original, "{line}");
+        }
     }
 
     #[test]
