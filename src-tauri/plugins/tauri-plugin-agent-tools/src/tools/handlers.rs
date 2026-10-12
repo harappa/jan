@@ -1151,7 +1151,7 @@ async fn collect_and_format(
 /// Keeps only the last [`BASH_MAX_BYTES`] raw bytes in memory; once total
 /// output exceeds that window it spills every byte to a temp file so nothing
 /// is lost while memory stays bounded.
-struct BashCapture {
+pub(crate) struct BashCapture {
     tail: std::collections::VecDeque<u8>,
     total_bytes: usize,
     total_newlines: usize,
@@ -1161,7 +1161,7 @@ struct BashCapture {
 }
 
 impl BashCapture {
-    fn new(scratch: Option<PathBuf>) -> Self {
+    pub(crate) fn new(scratch: Option<PathBuf>) -> Self {
         BashCapture {
             tail: std::collections::VecDeque::new(),
             total_bytes: 0,
@@ -1172,7 +1172,7 @@ impl BashCapture {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) {
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
         use std::io::Write;
         // Open the spill file the moment the window would overflow: at that
         // point `tail` still holds every byte seen so far (nothing dropped
@@ -1201,7 +1201,7 @@ impl BashCapture {
         }
     }
 
-    fn finish(mut self, code: Option<i32>) -> String {
+    pub(crate) fn finish(mut self, code: Option<i32>) -> String {
         use std::io::Write;
         if let Some(w) = self.spill.as_mut() {
             let _ = w.flush();

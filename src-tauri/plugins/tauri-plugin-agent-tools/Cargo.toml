@@ -142,3 +142,9 @@ windows-sys = { version = "0.60.2", features = [
 [[test]]
 name = "sandbox_spawn"
 harness = false
+
+# Python run for real inside the MXC process container; does nothing unless
+# `JAN_TEST_MXC=1` (see the file for the runtime it needs).
+[[test]]
+name = "python_mxc"
+required-features = ["python-tool"]
