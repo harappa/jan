@@ -148,4 +148,25 @@ describe('buildReasoningProviderOptions', () => {
       expect(buildReasoningProviderOptions('openai', modelWith({}))).toBeUndefined()
     })
   })
+
+  // Azure's v1 API runs the same Responses API through the OpenAI provider, so
+  // the effort travels under the same `openai` options key.
+  describe('azure', () => {
+    it('maps each concrete budget level to a reasoning effort', () => {
+      for (const level of ['low', 'medium', 'high', 'xhigh']) {
+        expect(
+          buildReasoningProviderOptions('azure', modelWith(budget(level)))
+        ).toEqual({
+          openai: { reasoningEffort: level, reasoningSummary: 'auto' },
+        })
+      }
+    })
+
+    it('sends no effort at the model default', () => {
+      expect(
+        buildReasoningProviderOptions('azure', modelWith(budget('unlimited')))
+      ).toBeUndefined()
+      expect(buildReasoningProviderOptions('azure', modelWith({}))).toBeUndefined()
+    })
+  })
 })

@@ -50,7 +50,7 @@ function readBudgetLevel(
  * - Google Gemini: `thinkingConfig.thinkingBudget` -1 (dynamic, model-sized) /
  *   0 (off), plus `includeThoughts` to surface thought summaries.
  * - Anthropic: `thinking` adaptive (model-sized, no token guess) / disabled.
- * - OpenAI: `reasoningEffort` discrete level (no budget).
+ * - OpenAI and Azure: `reasoningEffort` discrete level (no budget).
  *
  * Returns undefined when the provider has no mapping or the user left reasoning
  * at its provider default.
@@ -104,12 +104,13 @@ export function buildReasoningProviderOptions(
     return undefined
   }
 
-  if (providerId === 'openai') {
+  if (providerId === 'openai' || providerId === 'azure') {
     // Reasoning models always reason, so 'off' has no universal equivalent;
     // only a concrete effort level maps ('unlimited' = model default).
     // reasoningSummary surfaces the (otherwise hidden) reasoning as summary
-    // parts — it requires the Responses API, which model-factory selects when
-    // an effort level is set.
+    // parts — it requires the Responses API, which model-factory uses for both
+    // providers. Azure runs through the OpenAI provider, so its options travel
+    // under the same `openai` key.
     const effort = level ? LEVEL_TO_OPENAI_EFFORT[level] : undefined
     return effort
       ? { openai: { reasoningEffort: effort, reasoningSummary: 'auto' } }

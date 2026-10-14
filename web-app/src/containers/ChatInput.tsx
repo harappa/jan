@@ -2580,7 +2580,8 @@ const ChatInput = memo(function ChatInput({
                     selectedProvider === 'google' ||
                     selectedProvider === 'gemini' ||
                     selectedProvider === 'anthropic' ||
-                    selectedProvider === 'openai') &&
+                    selectedProvider === 'openai' ||
+                    selectedProvider === 'azure') &&
                   (() => {
                     // The token-budget submenu only applies to local llama.cpp
                     // (budget resolved against live n_ctx). Cloud providers size
@@ -2652,10 +2653,14 @@ const ChatInput = memo(function ChatInput({
                     }
 
                     // OpenAI reasoning models expose a discrete effort (no
-                    // on/off, no token budget). Reuse the thinking_budget_tokens
-                    // level as the effort value; "Default" clears it so the
-                    // model uses its own default effort.
-                    if (selectedProvider === 'openai') {
+                    // on/off, no token budget), and so do Azure's (the same
+                    // Responses API). Reuse the thinking_budget_tokens level as
+                    // the effort value; "Default" clears it so the model uses
+                    // its own default effort.
+                    if (
+                      selectedProvider === 'openai' ||
+                      selectedProvider === 'azure'
+                    ) {
                       const rawEffort =
                         selectedModel?.settings?.thinking_budget_tokens
                           ?.controller_props?.value

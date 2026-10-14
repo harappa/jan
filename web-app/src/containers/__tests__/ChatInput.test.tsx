@@ -627,6 +627,34 @@ describe('ChatInput', () => {
     })
   })
 
+  // Azure reasoning deployments take OpenAI's discrete effort levels, so they
+  // get the same effort menu as OpenAI (Default + Low..XHigh).
+  describe('reasoning effort for Azure', () => {
+    it('offers the effort menu at the model default', () => {
+      selectedProviderOverride = 'azure'
+      selectedModelOverride = { id: 'gpt-6.1-sol', provider: 'azure' }
+      renderInput()
+      expect(
+        screen.getByRole('button', { name: 'Reasoning effort: Default' })
+      ).toBeInTheDocument()
+    })
+
+    it('shows the effort chosen for the model', () => {
+      selectedProviderOverride = 'azure'
+      selectedModelOverride = {
+        id: 'gpt-6.1-sol',
+        provider: 'azure',
+        settings: {
+          thinking_budget_tokens: { controller_props: { value: 'high' } },
+        },
+      }
+      renderInput()
+      expect(
+        screen.getByRole('button', { name: 'Reasoning effort: High' })
+      ).toBeInTheDocument()
+    })
+  })
+
   // Cowork is not keyed by thread: it passes its session id as scopeKey, and
   // the preview panel writes annotation images under that same id. Reading the
   // thread key here silently dropped every annotation.
