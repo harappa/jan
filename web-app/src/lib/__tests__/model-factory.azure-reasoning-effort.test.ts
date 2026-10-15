@@ -37,7 +37,9 @@ const jsonResponse = (status: number, body: unknown) =>
     headers: { 'Content-Type': 'application/json' },
   })
 
-// The two shapes Azure answers a reasoning field it does not take with.
+// The two shapes Azure answers a reasoning field it does not take with, as a
+// live Azure AI Foundry resource returned them (2026-10-15). The value error's
+// message does not name the field; only `param` does.
 const unsupportedParameter = () =>
   jsonResponse(400, {
     error: {
@@ -52,9 +54,9 @@ const unsupportedValue = () =>
   jsonResponse(400, {
     error: {
       message:
-        "Unsupported value: 'reasoning.effort' does not support 'xhigh' with this model.",
+        "Unsupported value: 'minimal' is not supported with the 'gpt-6.1-sol-2026-09-29' model. Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.",
       type: 'invalid_request_error',
-      param: null,
+      param: 'reasoning.effort',
       code: 'unsupported_value',
     },
   })
@@ -314,6 +316,9 @@ describe('createCustomFetch — reasoning effort rejection', () => {
 
     expect(res.status).toBe(400)
     expect(baseFetch).toHaveBeenCalledTimes(1)
+    // The toast is shown through a dynamic import, so give it time to land
+    // before asserting that none was shown.
+    await new Promise((resolve) => setTimeout(resolve, 50))
     expect(toast.warning).not.toHaveBeenCalled()
   })
 })
