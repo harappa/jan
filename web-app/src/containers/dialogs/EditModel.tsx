@@ -19,10 +19,15 @@ import {
   IconLoader2,
   IconHeadphones,
   IconVideo,
+  IconBrain,
 } from '@tabler/icons-react'
 import { useState, useEffect } from 'react'
 import { useTranslation } from '@/i18n/react-i18next-compat'
 import { toast } from 'sonner'
+import {
+  isReasoningEffortEnabled,
+  withReasoningEffortEnabled,
+} from '@/lib/reasoningProviderOptions'
 
 // No need to define our own interface, we'll use the existing Model type
 type DialogEditModelProps = {
@@ -50,6 +55,11 @@ export const DialogEditModel = ({
     audio: false,
     video: false,
   })
+  // Only Azure models take the per-model reasoning effort switch.
+  const showReasoningEffort = provider.provider === 'azure'
+  const [reasoningEffortEnabled, setReasoningEffortEnabled] = useState(true)
+  const [originalReasoningEffortEnabled, setOriginalReasoningEffortEnabled] =
+    useState(true)
 
   // Initialize with the provided model ID or the first model if available
   useEffect(() => {
@@ -88,6 +98,10 @@ export const DialogEditModel = ({
       const displayNameValue = (selectedModel as Model & { displayName?: string }).displayName || selectedModel.id
       setDisplayName(displayNameValue)
       setOriginalDisplayName(displayNameValue)
+
+      const effortEnabled = isReasoningEffortEnabled(selectedModel)
+      setReasoningEffortEnabled(effortEnabled)
+      setOriginalReasoningEffortEnabled(effortEnabled)
     }
   }, [selectedModel])
 
@@ -109,7 +123,9 @@ export const DialogEditModel = ({
     const nameChanged = displayName !== originalDisplayName
     const capabilitiesChanged =
       JSON.stringify(capabilities) !== JSON.stringify(originalCapabilities)
-    return nameChanged || capabilitiesChanged
+    const reasoningEffortChanged =
+      reasoningEffortEnabled !== originalReasoningEffortEnabled
+    return nameChanged || capabilitiesChanged || reasoningEffortChanged
   }
 
   // Handle save changes
@@ -120,6 +136,8 @@ export const DialogEditModel = ({
     try {
       const nameChanged = displayName !== originalDisplayName
       const capabilitiesChanged = JSON.stringify(capabilities) !== JSON.stringify(originalCapabilities)
+      const reasoningEffortChanged =
+        reasoningEffortEnabled !== originalReasoningEffortEnabled
 
       // Build the update object for the selected model
       const modelUpdate: Partial<Model> & { _userConfiguredCapabilities?: boolean } = {}
@@ -136,9 +154,13 @@ export const DialogEditModel = ({
       }
 
       // Update the model in the provider models array
-      const updatedModels = provider.models.map((m: Model) =>
-        m.id === selectedModelId ? { ...m, ...modelUpdate } : m
-      )
+      const updatedModels = provider.models.map((m: Model) => {
+        if (m.id !== selectedModelId) return m
+        const updated = { ...m, ...modelUpdate } as Model
+        return reasoningEffortChanged
+          ? withReasoningEffortEnabled(updated, reasoningEffortEnabled)
+          : updated
+      })
 
       // Update the provider with the updated models
       updateProvider(provider.provider, {
@@ -149,6 +171,8 @@ export const DialogEditModel = ({
       // Update original values
       if (nameChanged) setOriginalDisplayName(displayName)
       if (capabilitiesChanged) setOriginalCapabilities(capabilities)
+      if (reasoningEffortChanged)
+        setOriginalReasoningEffortEnabled(reasoningEffortEnabled)
 
       // Show success toast and close dialog
       toast.success('Model updated successfully')
@@ -171,6 +195,7 @@ export const DialogEditModel = ({
       // Reset to original values when closing without saving
       setDisplayName(originalDisplayName)
       setCapabilities(originalCapabilities)
+      setReasoningEffortEnabled(originalReasoningEffortEnabled)
     }
     setIsOpen(open)
   }
@@ -308,6 +333,36 @@ export const DialogEditModel = ({
                 disabled={isLoading}
               />
             </div>
+
+            {showReasoningEffort && (
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex items-start space-x-2">
+                  <IconBrain className="size-4 text-muted-foreground mt-0.5 shrink-0" />
+                  <div>
+                    <span
+                      id="reasoning-effort-setting-label"
+                      className="text-sm"
+                    >
+                      {t('providers:editModel.reasoningEffort')}
+                    </span>
+                    <p
+                      id="reasoning-effort-setting-description"
+                      className="text-xs text-muted-foreground"
+                    >
+                      {t('providers:editModel.reasoningEffortDescription')}
+                    </p>
+                  </div>
+                </div>
+                <Switch
+                  id="reasoning-effort-setting"
+                  aria-labelledby="reasoning-effort-setting-label"
+                  aria-describedby="reasoning-effort-setting-description"
+                  checked={reasoningEffortEnabled}
+                  onCheckedChange={setReasoningEffortEnabled}
+                  disabled={isLoading}
+                />
+              </div>
+            )}
           </div>
         </div>
 

@@ -52,6 +52,7 @@ import {
   isThinkingBudgetLevelKey,
   type ThinkingBudgetLevelKey,
 } from '@/lib/thinkingBudget'
+import { isReasoningEffortEnabled } from '@/lib/reasoningProviderOptions'
 import { useReconcileVideoCapability } from '@/hooks/useReconcileVideoCapability'
 
 import { useAppState } from '@/hooks/useAppState'
@@ -2661,6 +2662,14 @@ const ChatInput = memo(function ChatInput({
                       selectedProvider === 'openai' ||
                       selectedProvider === 'azure'
                     ) {
+                      // An Azure model can have the effort turned off (by the
+                      // user, or by Jan when the model rejected it).
+                      if (
+                        selectedProvider === 'azure' &&
+                        !isReasoningEffortEnabled(selectedModel)
+                      ) {
+                        return null
+                      }
                       const rawEffort =
                         selectedModel?.settings?.thinking_budget_tokens
                           ?.controller_props?.value

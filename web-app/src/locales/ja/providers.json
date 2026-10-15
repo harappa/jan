@@ -79,6 +79,8 @@
     "proactive": "プロアクティブ（実験的）",
     "embeddings": "埋め込み",
     "notAvailable": "まだ利用できません",
+    "reasoningEffort": "推論の度合い",
+    "reasoningEffortDescription": "入力欄で選んだ推論の度合いを送ります。モデルが受け付けなかった場合は、Jan が自動でオフにします。",
     "warning": {
       "title": "注意して進めてください",
       "description": "モデルの機能を変更すると、パフォーマンスや機能に影響を与える可能性があります。不正な設定は、予期しない動作やエラーを引き起こす可能性があります。"
@@ -106,5 +108,9 @@
     "oneKeyHint": "任意のフォールバックキーは詳細設定で構成します。",
     "addKey": "キーを追加",
     "removeKey": "キーを削除"
+  },
+  "reasoningEffort": {
+    "disabledTitle": "推論の度合いの指定を無効にしました",
+    "disabledDescription": "{{model}} が推論の度合いの指定を受け付けなかったため、このモデルでは指定を送らないようにしました。モデルの設定から有効に戻せます。"
   }
 }

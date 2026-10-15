@@ -653,6 +653,37 @@ describe('ChatInput', () => {
         screen.getByRole('button', { name: 'Reasoning effort: High' })
       ).toBeInTheDocument()
     })
+
+    it('hides the effort menu for a model whose effort is turned off', () => {
+      selectedProviderOverride = 'azure'
+      selectedModelOverride = {
+        id: 'grok-4.7',
+        provider: 'azure',
+        settings: {
+          thinking_budget_tokens: { controller_props: { value: 'high' } },
+          reasoning_effort_enabled: { controller_props: { value: false } },
+        },
+      }
+      renderInput()
+      expect(
+        screen.queryByRole('button', { name: /^Reasoning effort:/ })
+      ).not.toBeInTheDocument()
+    })
+
+    it('keeps the effort menu when the flag is on', () => {
+      selectedProviderOverride = 'azure'
+      selectedModelOverride = {
+        id: 'gpt-6.1-sol',
+        provider: 'azure',
+        settings: {
+          reasoning_effort_enabled: { controller_props: { value: true } },
+        },
+      }
+      renderInput()
+      expect(
+        screen.getByRole('button', { name: 'Reasoning effort: Default' })
+      ).toBeInTheDocument()
+    })
   })
 
   // Cowork is not keyed by thread: it passes its session id as scopeKey, and

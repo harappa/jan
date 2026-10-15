@@ -34,6 +34,46 @@ function readReasoning(model: Model | null | undefined): ReasoningChoice {
   return v === 'on' || v === 'off' || v === 'auto' ? v : undefined
 }
 
+/** Model setting that turns the reasoning effort off for one Azure model. */
+export const REASONING_EFFORT_ENABLED_KEY = 'reasoning_effort_enabled'
+
+/**
+ * Whether the reasoning effort chosen in the chat input is sent for this
+ * model. Absent means enabled; Jan stores false when the model rejects it.
+ */
+export function isReasoningEffortEnabled(
+  model: Model | null | undefined
+): boolean {
+  return (
+    model?.settings?.[REASONING_EFFORT_ENABLED_KEY]?.controller_props?.value !==
+    false
+  )
+}
+
+/**
+ * Copy of `model` with the reasoning effort switched on or off. The chosen
+ * level (thinking_budget_tokens) is left alone, so switching back on
+ * restores it.
+ */
+export function withReasoningEffortEnabled(
+  model: Model,
+  enabled: boolean
+): Model {
+  return {
+    ...model,
+    settings: {
+      ...model.settings,
+      [REASONING_EFFORT_ENABLED_KEY]: {
+        key: REASONING_EFFORT_ENABLED_KEY,
+        title: 'Reasoning effort',
+        description: '',
+        controller_type: 'checkbox',
+        controller_props: { value: enabled },
+      },
+    },
+  } as Model
+}
+
 function readBudgetLevel(
   model: Model | null | undefined
 ): ThinkingBudgetLevelKey | undefined {
@@ -111,10 +151,20 @@ export function buildReasoningProviderOptions(
     // parts — it requires the Responses API, which model-factory uses for both
     // providers. Azure runs through the OpenAI provider, so its options travel
     // under the same `openai` key.
+    if (providerId === 'azure' && !isReasoningEffortEnabled(model)) {
+      return undefined
+    }
     const effort = level ? LEVEL_TO_OPENAI_EFFORT[level] : undefined
-    return effort
-      ? { openai: { reasoningEffort: effort, reasoningSummary: 'auto' } }
-      : undefined
+    if (!effort) return undefined
+    const options: JSONObject = {
+      reasoningEffort: effort,
+      reasoningSummary: 'auto',
+    }
+    // The SDK sends `reasoning` only for ids on its reasoning-model allowlist
+    // (o1, o3, gpt-5, ...). Azure deployment names are free-form, so force it;
+    // a model that rejects it is turned off by model-factory's fetch.
+    if (providerId === 'azure') options.forceReasoning = true
+    return { openai: options }
   }
 
   return undefined

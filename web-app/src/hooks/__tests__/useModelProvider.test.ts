@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { act, renderHook } from '@testing-library/react'
 import { useModelProvider } from '../useModelProvider'
+import { predefinedProviders } from '@/constants/providers'
 
 // Mock getServiceHub
 vi.mock('@/hooks/useServiceHub', () => ({
@@ -127,6 +128,60 @@ describe('useModelProvider - displayName functionality', () => {
     // The displayName should be preserved from existing state
     const provider = result.current.getProviderByName('llamacpp')
     expect(provider?.models[0].displayName).toBe('My Custom Model')
+  })
+
+  // On start-up the predefined providers are merged into the persisted state;
+  // a model's reasoning effort flag must come through that merge.
+  it('keeps an Azure model reasoning effort flag across the start-up merge', () => {
+    const { result } = renderHook(() => useModelProvider())
+    const effortOff = {
+      key: 'reasoning_effort_enabled',
+      title: 'Reasoning effort',
+      description: '',
+      controller_type: 'checkbox',
+      controller_props: { value: false },
+    }
+
+    act(() => {
+      useModelProvider.setState({
+        providers: [
+          {
+            provider: 'azure',
+            active: true,
+            base_url: 'https://my-resource.openai.azure.com/openai/v1',
+            models: [
+              {
+                id: 'grok-4.7',
+                settings: {
+                  thinking_budget_tokens: {
+                    controller_props: { value: 'high' },
+                  },
+                  reasoning_effort_enabled: effortOff,
+                },
+              },
+            ],
+            settings: [],
+          },
+        ] as any,
+        selectedProvider: 'azure',
+        selectedModel: null,
+        deletedModels: [],
+      })
+    })
+
+    const azure = predefinedProviders.find((p) => p.provider === 'azure')!
+    act(() => {
+      result.current.setProviders([
+        { ...azure, models: [] },
+      ] as unknown as ModelProvider[])
+    })
+
+    const model = result.current.getProviderByName('azure')?.models[0]
+    expect(model?.id).toBe('grok-4.7')
+    expect(model?.settings?.reasoning_effort_enabled).toEqual(effortOff)
+    expect(
+      model?.settings?.thinking_budget_tokens?.controller_props?.value
+    ).toBe('high')
   })
 
   it('should preserve user-controlled capabilities but always pick up engine-owned ones (vision/audio/embeddings) on refresh', () => {

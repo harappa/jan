@@ -10,6 +10,9 @@ const reasoning = (value: string) => ({
 const budget = (value: string) => ({
   thinking_budget_tokens: { controller_props: { value } },
 })
+const effortEnabled = (value: boolean) => ({
+  reasoning_effort_enabled: { controller_props: { value } },
+})
 
 describe('buildReasoningProviderOptions', () => {
   it('returns undefined for unknown/local providers', () => {
@@ -135,6 +138,17 @@ describe('buildReasoningProviderOptions', () => {
       }
     })
 
+    it('leaves forceReasoning and the Azure-only enable flag out of OpenAI', () => {
+      const options = buildReasoningProviderOptions(
+        'openai',
+        modelWith({ ...budget('high'), ...effortEnabled(false) })
+      )
+      expect(options).toEqual({
+        openai: { reasoningEffort: 'high', reasoningSummary: 'auto' },
+      })
+      expect(options?.openai).not.toHaveProperty('forceReasoning')
+    })
+
     it('treats unlimited as no explicit effort (model default)', () => {
       expect(
         buildReasoningProviderOptions('openai', modelWith(budget('unlimited')))
@@ -150,16 +164,48 @@ describe('buildReasoningProviderOptions', () => {
   })
 
   // Azure's v1 API runs the same Responses API through the OpenAI provider, so
-  // the effort travels under the same `openai` options key.
+  // the effort travels under the same `openai` options key. The SDK only sends
+  // it for ids it knows to be reasoning models, and Azure deployment names are
+  // free-form, so Azure forces it on.
   describe('azure', () => {
-    it('maps each concrete budget level to a reasoning effort', () => {
+    it('maps each concrete budget level to a forced reasoning effort', () => {
       for (const level of ['low', 'medium', 'high', 'xhigh']) {
         expect(
           buildReasoningProviderOptions('azure', modelWith(budget(level)))
         ).toEqual({
-          openai: { reasoningEffort: level, reasoningSummary: 'auto' },
+          openai: {
+            reasoningEffort: level,
+            reasoningSummary: 'auto',
+            forceReasoning: true,
+          },
         })
       }
+    })
+
+    it('treats an absent or true enable flag as enabled', () => {
+      for (const settings of [
+        budget('high'),
+        { ...budget('high'), ...effortEnabled(true) },
+      ]) {
+        expect(
+          buildReasoningProviderOptions('azure', modelWith(settings))
+        ).toEqual({
+          openai: {
+            reasoningEffort: 'high',
+            reasoningSummary: 'auto',
+            forceReasoning: true,
+          },
+        })
+      }
+    })
+
+    it('sends nothing for a model whose effort is turned off', () => {
+      expect(
+        buildReasoningProviderOptions(
+          'azure',
+          modelWith({ ...budget('high'), ...effortEnabled(false) })
+        )
+      ).toBeUndefined()
     })
 
     it('sends no effort at the model default', () => {

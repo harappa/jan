@@ -84,6 +84,8 @@ import { i18n } from '@/i18n/react-i18next-compat'
 import { useAppState } from '@/hooks/useAppState'
 import { useGeneralSetting } from '@/hooks/useGeneralSetting'
 import { ensureAnthropicHeaders } from '@/lib/remoteModelCatalog'
+import { useModelProvider } from '@/hooks/useModelProvider'
+import { withReasoningEffortEnabled } from '@/lib/reasoningProviderOptions'
 
 /**
  * Llama.cpp timings structure from the response
@@ -417,6 +419,83 @@ export function describeTransportError(err: unknown): string | null {
   return "Couldn't reach the provider — the connection failed. Check the provider's Base URL and your internet connection, then try again."
 }
 
+type UpstreamErrorBody = {
+  error?: { message?: unknown; [k: string]: unknown }
+}
+
+/** Parses an upstream error body; null when it is not JSON. */
+async function readErrorBody(
+  res: Response
+): Promise<UpstreamErrorBody | null> {
+  const contentType = res.headers.get('content-type') || ''
+  if (!contentType.includes('json')) return null
+  try {
+    return JSON.parse(await res.clone().text())
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Does this error say the request's `reasoning` field (effort or summary) is
+ * not accepted? Azure answers e.g. 400 `unsupported_parameter` "Unsupported
+ * parameter: 'reasoning.effort' is not supported with this model." or
+ * `unsupported_value` with a message naming reasoning.effort.
+ */
+export function isReasoningParamRejection(
+  status: number,
+  error: { message?: unknown; param?: unknown } | undefined
+): boolean {
+  // 408 and 429 are transient; they say nothing about the parameter.
+  if (status < 400 || status >= 500 || status === 408 || status === 429) {
+    return false
+  }
+  if (!error) return false
+  if (typeof error.param === 'string' && error.param.startsWith('reasoning')) {
+    return true
+  }
+  return (
+    typeof error.message === 'string' &&
+    /reasoning\.(effort|summary)/i.test(error.message)
+  )
+}
+
+/**
+ * Lets createCustomFetch recover when a model rejects the reasoning effort:
+ * the request is retried without `reasoning` and `onRejected` turns the
+ * effort off for the model, so later requests stop sending it.
+ */
+export interface ReasoningEffortGuard {
+  /** Model the requests are for; named in the notice. */
+  modelId: string
+  onRejected: () => void
+}
+
+/** Stores the reasoning effort as off for one model of a provider. */
+function disableReasoningEffort(providerName: string, modelId: string): void {
+  const { getProviderByName, updateProvider } = useModelProvider.getState()
+  const provider = getProviderByName(providerName)
+  if (!provider) return
+  const models = provider.models.map((m) =>
+    m.id === modelId ? withReasoningEffortEnabled(m, false) : m
+  )
+  updateProvider(providerName, { models })
+}
+
+function notifyReasoningEffortDisabled(modelId: string): void {
+  void import('sonner')
+    .then(({ toast }) => {
+      toast.warning(i18n.t('providers:reasoningEffort.disabledTitle'), {
+        description: i18n.t('providers:reasoningEffort.disabledDescription', {
+          model: modelId,
+        }),
+      })
+    })
+    .catch(() => {
+      console.warn('[reasoning-effort] turned off for', modelId)
+    })
+}
+
 function requestUrlOf(input: RequestInfo | URL): string {
   if (typeof input === 'string') return input
   if (input instanceof URL) return input.toString()
@@ -438,8 +517,13 @@ export function createCustomFetch(
   parameters: Record<string, unknown>,
   keepLlamacppOnly = false,
   onLlamacppServerError?: () => void,
-  filterNamedSseEvents = false
+  filterNamedSseEvents = false,
+  reasoningEffortGuard?: ReasoningEffortGuard
 ): typeof globalThis.fetch {
+  // Set once the model rejected the reasoning field; later requests through
+  // this fetch (the next steps of the same tool loop) go without it.
+  let reasoningRejected = false
+
   // Params entered via a text input arrive as strings (see InputControl).
   // Providers reject a string where a number is required, so coerce back to a
   // number when the param's predefined default is numeric.
@@ -526,50 +610,71 @@ export function createCustomFetch(
           `Failed to parse request body as JSON: ${e instanceof Error ? e.message : String(e)}`
         )
       }
+      if (reasoningEffortGuard && reasoningRejected) delete rawBody!.reasoning
       init = { ...init, body: JSON.stringify(buildBody(rawBody!, true)) }
     }
 
-    let res: Response
-    try {
-      res = await baseFetch(input, init)
-    } catch (err) {
-      const friendly = describeTransportError(err)
-      if (!friendly) throw err
-      throw new Error(`${friendly} (${requestUrlOf(input)})`)
+    const send = async (requestInit: RequestInit | undefined) => {
+      try {
+        return await baseFetch(input, requestInit)
+      } catch (err) {
+        const friendly = describeTransportError(err)
+        if (!friendly) throw err
+        throw new Error(`${friendly} (${requestUrlOf(input)})`)
+      }
     }
-    if (res.ok) {
+
+    const passOk = (ok: Response): Response => {
       // OpenAI-compatible servers may interleave custom named SSE events (e.g.
       // tool-progress) with chat.completion.chunk data; the AI SDK validates
       // every data line against the chunk schema, so strip non-default events.
       // Opt-in only: Anthropic and the OpenAI Responses API use named SSE
       // events as their protocol, so filtering there blanks the whole stream.
-      const contentType = res.headers.get('content-type') || ''
+      const contentType = ok.headers.get('content-type') || ''
       if (
         filterNamedSseEvents &&
-        res.body &&
+        ok.body &&
         contentType.includes('text/event-stream')
       ) {
-        return new Response(filterDefaultSseEvents(res.body), {
-          status: res.status,
-          statusText: res.statusText,
-          headers: res.headers,
+        return new Response(filterDefaultSseEvents(ok.body), {
+          status: ok.status,
+          statusText: ok.statusText,
+          headers: ok.headers,
         })
       }
-      return res
+      return ok
+    }
+
+    let res = await send(init)
+    if (res.ok) return passOk(res)
+
+    let parsed = await readErrorBody(res)
+
+    // Reasoning-rejection retry. Runs before the sampling retry below, whose
+    // patterns ("Unsupported parameter", "is not supported with this model")
+    // match this error too but would strip the sampling params and leave the
+    // rejected `reasoning` in place. Retry once without it, and turn the
+    // effort off for the model whether or not the retry succeeds.
+    if (
+      reasoningEffortGuard &&
+      rawBody &&
+      'reasoning' in rawBody &&
+      isReasoningParamRejection(res.status, parsed?.error)
+    ) {
+      reasoningRejected = true
+      delete rawBody.reasoning
+      init = { ...init, body: JSON.stringify(buildBody(rawBody, true)) }
+      reasoningEffortGuard.onRejected()
+      notifyReasoningEffortDisabled(reasoningEffortGuard.modelId)
+      res.body?.cancel().catch(() => {})
+      res = await send(init)
+      if (res.ok) return passOk(res)
+      // The retry's own error is handled below, so the sampling retry may
+      // still apply to it: two retries at most.
+      parsed = await readErrorBody(res)
     }
 
     const isLlamacpp500 = keepLlamacppOnly && res.status === 500
-
-    let parsed: { error?: { message?: unknown; [k: string]: unknown } } | null =
-      null
-    const contentType = res.headers.get('content-type') || ''
-    if (contentType.includes('json')) {
-      try {
-        parsed = JSON.parse(await res.clone().text())
-      } catch {
-        parsed = null
-      }
-    }
 
     const innerMessage =
       typeof parsed?.error?.message === 'string'
@@ -834,14 +939,16 @@ function createApiKeyRotatingFetch(
   apiKeys: string[],
   parameters: Record<string, unknown>,
   headerMode: ApiKeyHeaderMode,
-  filterNamedSseEvents = false
+  filterNamedSseEvents = false,
+  reasoningEffortGuard?: ReasoningEffortGuard
 ): typeof globalThis.fetch {
   const inner = createCustomFetch(
     baseFetch,
     parameters,
     false,
     undefined,
-    filterNamedSseEvents
+    filterNamedSseEvents,
+    reasoningEffortGuard
   )
   if (apiKeys.length <= 1) {
     return inner
@@ -1227,6 +1334,18 @@ export class ModelFactory {
       })
     }
 
+    // Azure deployments take the effort with forceReasoning (see
+    // buildReasoningProviderOptions); one that rejects it is retried without
+    // and has the effort turned off. OpenAI's own models are known to the SDK.
+    const providerName = provider.provider
+    const reasoningEffortGuard: ReasoningEffortGuard | undefined =
+      providerName === 'azure'
+        ? {
+            modelId,
+            onRejected: () => disableReasoningEffort(providerName, modelId),
+          }
+        : undefined
+
     const keyChain = providerRemoteApiKeyChain(provider)
     const fetchImpl =
       keyChain.length > 1
@@ -1234,9 +1353,18 @@ export class ModelFactory {
             getRuntimeFetch(),
             keyChain,
             parameters,
-            'authorization-bearer'
+            'authorization-bearer',
+            false,
+            reasoningEffortGuard
           )
-        : createCustomFetch(getRuntimeFetch(), parameters)
+        : createCustomFetch(
+            getRuntimeFetch(),
+            parameters,
+            false,
+            undefined,
+            false,
+            reasoningEffortGuard
+          )
 
     const openai = createOpenAI({
       apiKey: requireRemoteApiKey(provider, keyChain),

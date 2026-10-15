@@ -95,6 +95,8 @@
     "proactive": "Proactive (Experimental)",
     "embeddings": "Embeddings",
     "notAvailable": "Not available yet",
+    "reasoningEffort": "Reasoning effort",
+    "reasoningEffortDescription": "Send the reasoning effort chosen in the chat input. Jan turns this off by itself if the model rejects it.",
     "warning": {
       "title": "Proceed with Caution",
       "description": "Modifying model capabilities may affect performance and functionality. Incorrect settings could cause unexpected behavior or errors."
@@ -122,5 +124,9 @@
     "oneKeyHint": "Optional fallback keys are configured in Advanced.",
     "addKey": "Add key",
     "removeKey": "Remove key"
+  },
+  "reasoningEffort": {
+    "disabledTitle": "Reasoning effort turned off",
+    "disabledDescription": "{{model}} did not accept a reasoning effort, so Jan stopped sending one for it. You can turn it back on in the model's settings."
   }
 }

@@ -50,7 +50,7 @@ const provider = {
 const selectedModel: {
   id: string
   capabilities: string[]
-  settings?: Record<string, { controller_props: { value: string } }>
+  settings?: Record<string, { controller_props: { value: string | boolean } }>
 } = { id: 'gpt-6.1-sol', capabilities: [] }
 
 vi.mock('@/hooks/useServiceHub', () => ({
@@ -161,8 +161,21 @@ describe('reasoning effort for an Azure model', () => {
     }
     const call = await sendOnce()
     expect(call.providerOptions).toEqual({
-      openai: { reasoningEffort: 'xhigh', reasoningSummary: 'auto' },
+      openai: {
+        reasoningEffort: 'xhigh',
+        reasoningSummary: 'auto',
+        forceReasoning: true,
+      },
     })
+  })
+
+  it('sends no reasoning options once effort is turned off for the model', async () => {
+    selectedModel.settings = {
+      thinking_budget_tokens: { controller_props: { value: 'xhigh' } },
+      reasoning_effort_enabled: { controller_props: { value: false } },
+    }
+    const call = await sendOnce()
+    expect(call.providerOptions).toBeUndefined()
   })
 
   it('sends no reasoning options at the model default', async () => {
