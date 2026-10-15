@@ -50,6 +50,8 @@ Ensure your Azure resource has the model deployments you want to use.
 
 For a reasoning model, the brain icon in the chat input sets its reasoning effort (Low, Medium, High or XHigh). **Default** sends none, so the model uses its own. The choice is kept per model.
 
+If a model rejects the reasoning effort, Jan sends the message again without it and stops sending one for that model. To send it again, turn on **Reasoning effort** in the model's edit dialog (the pencil next to the model in **Settings** > **Model Providers** > **Azure**).
+
 </Steps>
 
 ## Troubleshooting
